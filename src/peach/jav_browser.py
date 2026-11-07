@@ -9,6 +9,7 @@ import math
 import re
 import secrets
 import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -18,9 +19,12 @@ from .catalog_rules import (
 )
 from .config import PROJECT_ROOT
 from .downloads import (
-    CLOUDDRIVE_CREDENTIAL, INGESTED, POSTPROCESS_LABELS, REMOTE_RUNNING, RESUBMITTABLE_STATES,
-    STATE_LABELS, never_seen, submit_offline_download, parse_magnet,
+    CLOUDDRIVE_CREDENTIAL, INGESTED, POSTPROCESS_FAILED, POSTPROCESS_PENDING, POSTPROCESS_QUEUED,
+    POSTPROCESS_RUNNING, REMOTE_RUNNING, RESUBMITTABLE_STATES, STATE_LABELS, TRACKED_STATES, iso,
+    never_seen, submit_offline_download, parse_magnet,
+    parse_iso, DownloadError,
 )
+from .task_retry import RETRY_DELAYS, RetryableTaskError, retry_delay
 from .follow_secrets import CredentialError
 from .feeds import scan_code
 from .fsutil import atomic_write_text
@@ -29,6 +33,14 @@ from .sources.dmm import code_from_cid
 LOGGER = logging.getLogger(__name__)
 CREDENTIAL = "jav-browser"
 ACTIVE = {"queued", "searching"}
+#: 共享进度列表的上限，与持久队列同为 200；结束的任务保留 10 分钟，供各窗口看到完成。
+ACTIVE_LIMIT = 200
+RECENT_SECONDS = 600
+#: 浏览器添加的任务结束后一直留在列表里，直到用户在脚本里标为已读；键是「任务编号@结束时间」。
+ENDED_KEY = re.compile(r"^[1-9][0-9]{0,11}@[0-9T:+.\-]{19,32}$")
+ENDED_DISMISSED_LIMIT = 1000
+#: 结束时间：整理完成的取整理时间，失败、取消、停滞取结束时间；停滞复查只改 updated_at，不让任务重新冒出来。
+ENDED_AT = "coalesce(nullif(postprocessed_at,''), nullif(finished_at,''), updated_at)"
 MESSAGES = {
     "idle": "可以加入 Peach 馆藏", "queued": "等待搜索磁力", "searching": "正在搜索磁力",
     "submitted": "云下载进行中", "ingested": "已加入 Peach 馆藏", "owned": "馆藏已有该番号影片",
@@ -113,7 +125,9 @@ def identify_source(value: object, hint: str = "") -> str:
                 (dict(parse_qsl(url.query)).get(key, "") for key in site.get("query_keys", ())), "")
     if not product:
         raise ValueError("未识别到作品番号，请选中页面的完整番号后加入 Peach")
-    code = code_key(code_from_cid(product) if site["id"] == "dmm" else product)
+    # DMM 的商品号按编目规则拆出番号；FC2 内容市场的商品页地址里只有数字编号，番号是 FC2-PPV-<编号>。
+    code = code_key(code_from_cid(product) if site["id"] == "dmm"
+                    else f"FC2-PPV-{product}" if site["id"] == "fc2-market" else product)
     if hint and not same_release_code(code, code_key(hint)):
         raise ValueError("页面番号与商品号不一致，请核对作品详情")
     return code
@@ -137,6 +151,16 @@ def _download_candidate(items, code, skip=frozenset()):
     return None
 
 
+def _postprocess_retry_status(task) -> dict:
+    """后处理的等待与耗尽状态，投影成浏览器可读的重试回执。"""
+    if task.postprocess_state == POSTPROCESS_PENDING and task.next_check_at:
+        return {'retry_at': task.next_check_at, 'retry_attempt': task.postprocess_retries,
+                'retry_limit': len(RETRY_DELAYS)}
+    if task.postprocess_state == 'failed' and task.postprocess_retries >= len(RETRY_DELAYS):
+        return {'retry_exhausted': True, 'retry_attempt': task.postprocess_retries, 'retry_limit': len(RETRY_DELAYS)}
+    return {}
+
+
 class JavBrowser:
     """本机持久队列；搜索完成前退出时，下一次启动继续处理。"""
 
@@ -145,6 +169,7 @@ class JavBrowser:
         self.downloads = contract.downloads
         self.credentials = self.downloads.credentials
         self.path = Path(contract.follow_state_root) / "jav-browser-queue.json"
+        self.ended_path = Path(contract.follow_state_root) / "jav-browser-ended.json"
         self.search = search
         self._lock = threading.RLock()
         self._wake = threading.Event()
@@ -154,6 +179,7 @@ class JavBrowser:
         from .jav_browser_diagnostics import BrowserDiagnostics
         self.diagnostics = BrowserDiagnostics()
         self.rows = self._load()
+        self.ended = self._load_ended()
 
     def _load(self) -> dict:
         if not self.path.exists():
@@ -165,6 +191,10 @@ class JavBrowser:
         for key, row in payload.items():
             if not isinstance(row, dict) or normalise_code_key(key) != key or row.get("state") not in MESSAGES:
                 raise ValueError("浏览器添加队列无法读取")
+            if 'retry_attempt' in row and (type(row['retry_attempt']) is not int or not 0 <= row['retry_attempt'] <= len(RETRY_DELAYS)):
+                raise ValueError('浏览器添加重试次数无效')
+            if 'retry_at' in row and (not isinstance(row['retry_at'], str) or parse_iso(row['retry_at']) is None):
+                raise ValueError('浏览器添加重试时间无效')
             if row["state"] == "searching":
                 row["state"] = "queued"
             # 店铺前缀归一之前记下的行（`107STZY-019`）改记到裸番号下，裸番号已有记录时以它为准。
@@ -175,6 +205,40 @@ class JavBrowser:
 
     def _save(self):
         atomic_write_text(self.path, json.dumps(self.rows, ensure_ascii=False, indent=2) + "\n")
+
+    def _load_ended(self) -> dict:
+        """结束留存的确认记录：`since` 之前结束的都算确认过，之后的逐条记在 `dismissed` 里。
+
+        文件不存在时从 10 分钟前起算并立即落盘，启用之前早已结束的任务不会一下子涌进浮卡。
+        """
+        try:
+            payload = json.loads(self.ended_path.read_text(encoding="utf-8"))
+            since, dismissed = payload["since"], payload["dismissed"]
+            if (not isinstance(since, str) or not isinstance(dismissed, list)
+                    or not all(isinstance(key, str) and ENDED_KEY.match(key) for key in dismissed)):
+                raise ValueError
+            return {"since": since, "dismissed": dismissed[-ENDED_DISMISSED_LIMIT:]}
+        except FileNotFoundError:
+            ended = {"since": iso(time.time() - RECENT_SECONDS), "dismissed": []}
+        except (ValueError, KeyError, TypeError):
+            LOGGER.warning("浏览器添加的结束确认记录无法读取，从现在起重新计")
+            ended = {"since": iso(time.time()), "dismissed": []}
+        atomic_write_text(self.ended_path, json.dumps(ended, ensure_ascii=False, indent=2) + "\n")
+        return ended
+
+    def dismiss(self, body: dict) -> dict:
+        """确认已结束的任务：`all` 确认到此刻为止结束的全部，`keys` 逐条确认 `active()` 给出的键。"""
+        keys = body.get("keys", [])
+        if body.get("all") not in (None, False, True) or not isinstance(keys, list) or len(keys) > ACTIVE_LIMIT \
+                or not all(isinstance(key, str) and ENDED_KEY.match(key) for key in keys):
+            raise ValueError("确认参数无效")
+        with self._lock:
+            since = iso(time.time()) if body.get("all") is True else self.ended["since"]
+            dismissed = [key for key in dict.fromkeys([*self.ended["dismissed"], *keys])
+                         if key.split("@", 1)[1] >= since]
+            self.ended = {"since": since, "dismissed": dismissed[-ENDED_DISMISSED_LIMIT:]}
+            atomic_write_text(self.ended_path, json.dumps(self.ended, ensure_ascii=False, indent=2) + "\n")
+        return self.active()
 
     def _config(self) -> dict:
         credential = self.credentials.load(CREDENTIAL)
@@ -246,11 +310,14 @@ class JavBrowser:
             row = connection.execute(
                 "SELECT id FROM asset WHERE normalise_code_key(code)=? AND medium='video' "
                 "AND disposal IS NULL ORDER BY id LIMIT 1", (code,)).fetchone()
-            if row:
-                return {"state": "owned", "asset_id": row[0]}
             tasks = connection.execute(
-                "SELECT id,state FROM download_task WHERE normalise_code_key(code)=? "
+                "SELECT id,state,postprocess_state FROM download_task WHERE normalise_code_key(code)=? "
                 "ORDER BY id DESC", (code,)).fetchall()
+        if tasks and tasks[0]['state'] == INGESTED and tasks[0]['postprocess_state'] in {
+                POSTPROCESS_PENDING, POSTPROCESS_QUEUED, POSTPROCESS_RUNNING, POSTPROCESS_FAILED}:
+            return {'state': 'ingested', 'task_id': tasks[0]['id']}
+        if row:
+            return {"state": "owned", "asset_id": row[0]}
         for task in tasks:
             if task["state"] not in RESUBMITTABLE_STATES:
                 return {"state": "ingested" if task["state"] == INGESTED else "submitted", "task_id": task["id"]}
@@ -285,12 +352,66 @@ class JavBrowser:
                     "progress": min(1.0, max(0.0, progress)) if task.state in {REMOTE_RUNNING, "remote_done", "landed", INGESTED}
                         and type(progress) in (int, float) and math.isfinite(progress) else None,
                     "postprocess_state": task.postprocess_state,
-                    "postprocess_label": POSTPROCESS_LABELS.get(task.postprocess_state, ""),
+                    "postprocess_label": task.postprocess_label,
                     "updated_at": task.updated_at}
+                row.update(_postprocess_retry_status(task))
             state = row.get("state", "idle")
             return {"ok": True, "code": code, **row, **detail, "state": state,
                     "stage": "submitting" if code in self._submitting else state,
                     "message": row.get("message") or MESSAGES[state]}
+
+    def retry_postprocess(self, value: object) -> dict:
+        """重试这个番号入库后失败的整理，与任务中心的「重试整理」同一入口。"""
+        status = self.status(value)
+        task_id = status.get("task_id")
+        if not task_id or status["state"] != "ingested" or status.get("download", {}).get("postprocess_state") != "failed":
+            raise ValueError("这个番号没有失败的整理可以重试")
+        self.downloads.retry_postprocess(int(task_id))
+        return self.status(value)
+
+    def active(self) -> dict:
+        """进行中与最近结束的任务，供用户脚本的各个窗口共享同一份进度。
+
+        进行中与脚本 `tracking()` 同一判据：排队、搜索、云下载，或已入库但整理未结束。
+        最近 `RECENT_SECONDS` 内结束的任务带着终态留在列表里，脚本据此看到「进行中 → 完成」。
+        浏览器添加（来处 `browser:`）的任务结束后一直留着，直到 `dismiss()` 确认。结束项带 `ended_key`
+        与 `dismissed`：确认过的在 10 分钟内仍然列出、只标 `dismissed`，各窗口的本页状态照旧读得到。
+        """
+        cutoff = iso(time.time() - RECENT_SECONDS)
+        tracked = sorted(TRACKED_STATES)
+        organizing = (POSTPROCESS_PENDING, POSTPROCESS_QUEUED, POSTPROCESS_RUNNING)
+        with self._lock:
+            since, dismissed = self.ended["since"], set(self.ended["dismissed"])
+        with self.contract.database.read_connection() as connection:
+            codes = [row[0] for row in connection.execute(
+                "SELECT normalise_code_key(code) AS key FROM download_task WHERE code IS NOT NULL AND code<>'' AND ("
+                f"state IN ({','.join('?' * len(tracked))}) OR (state=? AND postprocess_state IN (?,?,?)) "
+                "OR max(updated_at, coalesce(postprocessed_at,''), coalesce(finished_at,''))>=? "
+                f"OR (origin LIKE 'browser:%' AND {ENDED_AT}>=?)) "
+                "GROUP BY key ORDER BY max(id) DESC LIMIT ?",
+                (*tracked, INGESTED, *organizing, cutoff, since, ACTIVE_LIMIT))]
+        with self._lock:
+            queued = [code for code, row in self.rows.items() if row["state"] in ACTIVE or code in self._submitting]
+        items = []
+        for code in dict.fromkeys([*queued, *codes]):
+            try:
+                status = self.status(code)
+            except ValueError:
+                continue
+            if status["state"] == "idle":
+                continue
+            task = self.downloads.store.get(status["task_id"]) if status.get("task_id") else None
+            if task is not None and task.state not in TRACKED_STATES and not (
+                    task.state == INGESTED and task.postprocess_state in organizing):
+                ended_at = task.postprocessed_at or task.finished_at or task.updated_at
+                key = f"{task.id}@{ended_at}"
+                acknowledged = ended_at < since or key in dismissed
+                recent = max(task.updated_at or "", task.postprocessed_at or "", task.finished_at or "") >= cutoff
+                if not recent and (acknowledged or not (task.origin or "").startswith("browser:")):
+                    continue
+                status.update(ended_key=key, dismissed=acknowledged)
+            items.append(status)
+        return {"ok": True, "items": items[:ACTIVE_LIMIT]}
 
     def add(self, body: dict) -> dict:
         code = code_key(body.get("code"))
@@ -332,7 +453,8 @@ class JavBrowser:
         with self._lock:
             if self._stop.is_set() or not self.downloads.available or not self._config().get("token_hash"):
                 return False
-            code = next((key for key, row in self.rows.items() if row["state"] == "queued"), None)
+            code = next((key for key, row in self.rows.items() if row["state"] == "queued"
+                         and (not row.get('retry_at') or parse_iso(row['retry_at']) <= self.downloads.clock())), None)
             if code is None:
                 return False
             row = self.rows[code]
@@ -342,6 +464,7 @@ class JavBrowser:
                 self._save()
                 return True
             row["state"] = "searching"
+            row.pop('retry_at', None)
             self._save()
             provider = row["provider"]
         try:
@@ -358,10 +481,7 @@ class JavBrowser:
                 elif existing := self._existing(code):
                     row.update(existing)
                 elif candidate is None:
-                    failed = result.get("state") in {"error", "unavailable"} or bool(result.get("error"))
-                    row.update(state="failed" if failed else "no_match", message=(
-                        "资源搜索暂不可用，请在 Peach 检查来源后重试" if failed
-                        else NO_OTHER_MAGNET if row.get("skip") else MESSAGES["no_match"]))
+                    self._empty_search_result(row, result)
                 else:
                     self._submitting.add(code)
                     should_submit = True
@@ -384,9 +504,32 @@ class JavBrowser:
             with self._lock:
                 self._submitting.discard(code)
                 if row["state"] == "searching":
-                    row.update(state="failed", message="搜索或云下载提交失败，请在 Peach 检查下载渠道后重试")
+                    retry_error = RetryableTaskError(error.detail) if isinstance(error, DownloadError) and error.retryable else error
+                    self._schedule_retry(row, retry_error)
                     self._save()
         return True
+
+    def _empty_search_result(self, row: dict, result: dict) -> None:
+        """搜索没有正片磁力时，分别结算无命中、可恢复故障与永久故障。"""
+        failed = result.get('state') in {'error', 'unavailable'} or bool(result.get('error'))
+        message = ('资源搜索暂不可用，请在 Peach 检查来源后重试' if failed
+                   else NO_OTHER_MAGNET if row.get('skip') else MESSAGES['no_match'])
+        after = result.get('retry_after')
+        if failed and type(after) in (int, float) and math.isfinite(after) and after >= 0:
+            self._schedule_retry(row, RetryableTaskError(message, after=after))
+        else:
+            row.update(state='failed' if failed else 'no_match', message=message)
+
+    def _schedule_retry(self, row: dict, error: Exception) -> None:
+        attempt = row.get('retry_attempt', 0)
+        delay = retry_delay(error, attempt)
+        if delay is None:
+            prefix = f'自动重试 {attempt} 次后仍未完成；' if attempt == len(RETRY_DELAYS) else ''
+            row.update(state='failed', message=prefix + '搜索或云下载提交失败，请在 Peach 检查来源和下载渠道后重试')
+            row['retry_exhausted'] = attempt == len(RETRY_DELAYS)
+            return
+        row.update(state='queued', retry_attempt=attempt + 1, retry_limit=len(RETRY_DELAYS),
+                   retry_at=iso(self.downloads.clock() + delay), message='暂时不可用，等待自动重试')
 
     def start(self):
         if not self.downloads.available or self._thread is not None:

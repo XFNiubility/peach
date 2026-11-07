@@ -6,6 +6,7 @@ import { apiGet, apiSend } from '../../api';
 import { fmtSize } from '@peach/legacy/core';
 import { requestErrorMessage } from '../../core/request-error';
 import { queryClient } from '../query';
+import type { ProcessingSpeed } from '../library-processing/library-processing';
 
 export const TASKS_URL = '/api/tasks';
 /** 整页共用这一个键：三段是同一次响应的三个字段。 */
@@ -14,7 +15,8 @@ export const TASKS_KEY = ['tasks'] as const;
 export type TaskControlAction = 'pause' | 'resume' | 'cancel';
 export type TaskControlState = 'running' | 'pausing' | 'paused' | 'cancelling';
 export type TaskResourceState = 'ready' | 'sampling' | 'unavailable';
-export interface TaskResourceMetric { state: TaskResourceState; high: boolean; reason?: string }
+/** `via` 只出现在未取得的网络读数上：`cloud` 是从网盘挂载读的，网速无法按任务计量。 */
+export interface TaskResourceMetric { state: TaskResourceState; high: boolean; reason?: string; via?: 'cloud' }
 export interface TaskPercentMetric extends TaskResourceMetric { percent: number | null }
 export interface TaskResourcesPayload {
   cpu: TaskPercentMetric;
@@ -46,12 +48,14 @@ export interface TaskRunPayload {
   followup_key: string;
   followup_depth: number;
   /** 服务端给出当前控制状态与可用动作，界面不按任务种类推断。 */
-  control?: { state: TaskControlState; actions: TaskControlAction[] };
+  control?: { state: TaskControlState; actions: (TaskControlAction | 'set_speed')[]; speed_mode?: ProcessingSpeed };
   /** 只投影可归属的实测读数；缺失字段代表该快照未提供资源采样。 */
   resources?: TaskResourcesPayload;
 }
 
 export interface ActivityData {
+  finished_total?: number;
+  finished_page?: number;
   available: boolean;
   result_versions?: Record<string, string>;
   message?: string;
@@ -64,16 +68,13 @@ export interface ActivityData {
   working_parents?: TaskRunPayload[];
   /** 父任务 id → 它直接派出的后继按状态各几条。下发的后继只是一部分，进度与「还在不在跑」看这份。 */
   followup_counts?: FollowupCounts;
+  /** 逐部到来的入库通知：云下载整理完成、推送发现登记的新影片。`epoch` 换了表示服务重启过。 */
+  ingest_notices?: { epoch: string; items: IngestNotice[] };
 }
+
+export interface IngestNotice { id: number; kind: 'download' | 'discovered'; asset_id: number; label: string; at: number }
 
 export type FollowupCounts = Record<string, Record<string, number>>;
-
-/** 往前翻的一页：只有「最近完成」，在跑与被挡下的由轮询那一份负责。 */
-export interface FinishedPage {
-  finished: TaskRunPayload[];
-  finished_has_more: boolean;
-  followup_counts?: FollowupCounts;
-}
 
 /** 几轮派出的后继合在一起数：共几条、结束了几条、还有几条在排或在跑。 */
 export function followupTally(counts: FollowupCounts | undefined, runs: TaskRunPayload[]) {
@@ -90,34 +91,16 @@ export function followupTally(counts: FollowupCounts | undefined, runs: TaskRunP
 }
 
 /** 同一种任务连着派出的几轮合成一件事：自动修复每分钟派一批，一屏十几张「已完成」卡说的是同一件事。
- *  每组按最新那一轮排在前面，`runs[0]` 是最新那一轮。 */
-export function foldByKind(rows: TaskRunPayload[]): RunFold[] {
+ *  每组按最新那一轮排在前面，`runs[0]` 是最新那一轮。`split` 再按它的值分组，同一种任务值不同的分开。 */
+export function foldByKind(rows: TaskRunPayload[], split: (run: TaskRunPayload) => string = () => ''): RunFold[] {
   const folds = new Map<string, RunFold>();
   for (const run of rows) {
-    const fold = folds.get(run.task_key);
+    const key = `${run.task_key}\u0000${split(run)}`;
+    const fold = folds.get(key);
     if (fold) fold.runs.push(run);
-    else folds.set(run.task_key, { run, runs: [run] });
+    else folds.set(key, { run, runs: [run] });
   }
   return [...folds.values()];
-}
-
-/** 以 `oldest` 为游标取它之前的一页。游标是它的结束时刻加 id，与服务端的排序键一致。 */
-export const fetchEarlier = (oldest: TaskRunPayload, signal?: AbortSignal) => {
-  const query = new URLSearchParams({
-    before_finished_at: oldest.finished_at || '', before_id: String(oldest.id) });
-  return apiGet<FinishedPage>(`${TASKS_URL}?${query}`, signal);
-};
-
-/** 几批终态行并成一列：同一轮只留一条，按结束时刻从新到旧、同一时刻按 id 从大到小，
- *  和服务端翻页的排序键同一个，拼接处才不会乱序。终态落地后不再变，重复的哪一份都一样。 */
-export function mergeFinished(...batches: TaskRunPayload[][]): TaskRunPayload[] {
-  const byId = new Map<number, TaskRunPayload>();
-  for (const batch of batches) for (const row of batch) if (!byId.has(row.id)) byId.set(row.id, row);
-  return [...byId.values()].sort((a, b) => {
-    const left = a.finished_at || '', right = b.finished_at || '';
-    if (left !== right) return left < right ? 1 : -1;
-    return b.id - a.id;
-  });
 }
 
 /** 有东西在跑就两秒一次（和进度写库的节流同一个数），全是终态时十秒一次。 */
@@ -126,10 +109,20 @@ export const SETTLED_POLL_MS = 10000;
 export const pollInterval = (data: ActivityData | undefined): number =>
   data?.running?.length ? RUNNING_POLL_MS : SETTLED_POLL_MS;
 
-export const fetchTasks = (signal?: AbortSignal) => apiGet<ActivityData>(TASKS_URL, signal);
+export const fetchTasks = (signal?: AbortSignal, page = 1, limit = 20) =>
+  apiGet<ActivityData>(page === 1 && limit === 20 ? TASKS_URL : `${TASKS_URL}?page=${page}&limit=${limit}`, signal);
+
+/** 每个页面常驻轮询的那一小份：结果版本、入库通知与有没有任务在排或在跑。完整任务列表只给任务中心。 */
+export const RESULT_UPDATES_KEY = ['result-updates'] as const;
+export type ResultUpdatesData = Pick<ActivityData, 'result_versions' | 'ingest_notices'> & { busy?: boolean };
+export const fetchResultUpdates = (signal?: AbortSignal) =>
+  apiGet<ResultUpdatesData>('/api/result-updates', signal);
 
 export const controlTask = (id: number, action: TaskControlAction, signal?: AbortSignal) =>
   apiSend(`${TASKS_URL}/${id}/control`, { action }, 'POST', signal);
+
+export const setTaskSpeed = (id: number, speed: ProcessingSpeed) =>
+  apiSend(`${TASKS_URL}/${id}/control`, { action: 'set_speed', speed_mode: speed }, 'POST');
 
 /** 首屏：取完数才画。中止时 `fetchQuery` 把 `AbortError` 抛回给挂载方，它据此放弃这一次。 */
 export async function prefetchTasks(signal: AbortSignal): Promise<void> {
@@ -228,6 +221,14 @@ export function problemDestination(run: TaskRunPayload, latest = true): { href: 
   return target ? { href: target[0], label: target[1] } : null;
 }
 
+/** 这一轮只处理一部作品时，摘要里带它的 `asset_id` 与文件名，任务卡据此链接到作品详情。 */
+export function taskSubject(run: TaskRunPayload): { href: string; label: string } | null {
+  const id = run.result_summary?.asset_id;
+  const name = run.result_summary?.name;
+  return typeof id === 'number' && Number.isInteger(id) && id > 0 && typeof name === 'string' && name
+    ? { href: `/assets/${id}`, label: name } : null;
+}
+
 /** `LATEST_ONLY` 里每种任务最新那一轮的 id。后继不算：它们挂在父任务下，不是这种任务的一轮。 */
 export function latestOfKind(rows: TaskRunPayload[]): Set<number> {
   const newest = new Map<string, number>();
@@ -286,7 +287,7 @@ export const isRoutine = (run: TaskRunPayload) => run.trigger === 'scheduled'
 export const isActive = (run: TaskRunPayload) => run.status === 'pending' || run.status === 'running';
 
 /** 后继那一行的说明：它在做哪一件（标签去掉与任务名重复的前缀）、做到第几项或结果如何。
- *  标题已经是任务名，这里再写一遍「取新作资料：」读起来就是同一句话说了两次。 */
+ *  标题已经是任务名，这里再写一遍「新作资料采集：」读起来就是同一句话说了两次。 */
 export function followupDetail(row: TaskRunPayload): string {
   const prefix = `${row.task_label}：`;
   const label = row.progress_label || '';

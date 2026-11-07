@@ -8,7 +8,7 @@ import { MediaCard, cardRatio, type MediaCardVariant } from '../../src/react/com
 import { CatalogGridPage, LoadMore } from '../../src/react/catalog-grid/catalog-grid-page';
 import type { CatalogGridProps } from '../../src/react/catalog-grid/types';
 import {
-  MIX_SLOT, SHORTS_BATCH, arrangeTiles, catalogParams, collapseGroups, fetchCatalogPage, latestCatalogPages, mixSeed, nextOffset,
+  MIX_SLOT, SHORTS_BATCH, arrangeTiles, catalogParams, catalogSummary, collapseGroups, fetchCatalogPage, latestCatalogPages, mixSeed, nextOffset, visibleCatalogBatch,
   shortsBoundaries, shortsParams, replaceCatalogItem, type GridPage,
 } from '../../src/react/catalog-grid/catalog-grid';
 import type { MediaCardActions, MediaCardHelpers, MediaCardLayout, MediaItem } from '../../src/react/catalog-grid/types';
@@ -73,6 +73,20 @@ describe('目录取数', () => {
     fetcher.mockClear();
     await fetchCatalogPage('state=trash', 0, 60, true, new AbortController().signal);
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('首批按视口截短后，下一页紧接实际条数，不跳过中间作品', () => {
+    expect(visibleCatalogBatch(6, 450, 200, 16, 60)).toBe(18);
+    expect(nextOffset(60)({ ...page([item(1)], 0, { has_more: true }), batch: 18 })).toBe(18);
+  });
+
+  it('聚合统计保持主列表筛选，独立读取不请求卡片', async () => {
+    const fetcher = vi.fn(async (_url: string) => ({ ok: true, status: 200,
+      json: async () => ({ total: 12, bytes: 240, work_total: 10 }) }));
+    vi.stubGlobal('fetch', fetcher);
+    expect(await catalogSummary('loc=115&tag=example', new AbortController().signal)).toEqual({ total: 12, bytes: 240, work_total: 10 });
+    const query = new URL(String(fetcher.mock.calls[0]![0]), 'http://peach.test').searchParams;
+    expect(Object.fromEntries(query)).toEqual({ loc: '115', tag: 'example', summary_only: '1' });
   });
 
   it('下一页从哪儿取：第一页看总数，往后看 has_more', () => {
@@ -417,8 +431,8 @@ describe('作品卡', () => {
   it('关注来源保存的条目用来源的缩略图和标签，标签不可点', async () => {
     const { host } = await render(item(12, { follow_thumb_url: 'https://example.test/t.jpg', follow_item_id: 5, tags: ['本地'], follow_tags: ['来源'] }));
     expect(host.querySelector('[data-media-art] img')?.getAttribute('src')).toBe('https://example.test/t.jpg');
-    const tag = host.querySelector<HTMLButtonElement>('[data-media-tag]');
-    expect([tag?.textContent, tag?.disabled]).toEqual(['#来源', true]);
+    const tag = host.querySelector('[data-media-tag]');
+    expect([tag?.textContent, tag?.tagName, tag?.hasAttribute('data-tag')]).toEqual(['#来源', 'SPAN', false]);
   });
 
   it('看到一半的画一条进度，分卷组不画；比例写进封面格', async () => {

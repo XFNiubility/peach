@@ -36,6 +36,8 @@ class Usage:
         self.processes = {}
         self.network_bytes = 0
         self.network_error = ''
+        #: 读数未取得时传输走的是哪一路；`cloud` 是网盘挂载，界面据此写「网盘读取」。
+        self.network_via = ''
         self.lock = threading.RLock()
         self.saved_at = 0.0
         with _LOCK:
@@ -45,7 +47,7 @@ class Usage:
         with self.lock:
             return {'pid': self.pid, 'created': self.created, 'threads': list(self.threads),
                     'processes': dict(self.processes), 'network_bytes': self.network_bytes,
-                    'network_error': self.network_error}
+                    'network_error': self.network_error, 'network_via': self.network_via}
 
     def publish(self, *, force=False):
         now = time.monotonic()
@@ -99,12 +101,13 @@ def record_download(size):
         control.usage.publish()
 
 
-def unobserved_network(reason):
+def unobserved_network(reason, *, via=''):
     from .task_control import CURRENT
     control = CURRENT.get()
     if control is not None:
         with control.usage.lock:
             control.usage.network_error = reason
+            control.usage.network_via = via
         control.usage.publish(force=True)
 
 
@@ -119,8 +122,10 @@ def media_input(path):
     raw = str(source_identity(path))
     config = settings_file.active()
     location, _index, _tail = resolve_root(raw, config.locations)
-    if location in CLOUD_LOCATIONS or resolve(raw, config) is not None:
-        unobserved_network('挂载或 SMB 的缓存与预读无法按任务取得实际网速')
+    if location in CLOUD_LOCATIONS:
+        unobserved_network('网盘挂载的缓存与预读无法按任务取得实际网速', via='cloud')
+    elif resolve(raw, config) is not None:
+        unobserved_network('SMB 的缓存与预读无法按任务取得实际网速')
 
 
 def _metric(state, field, value=None, reason='', threshold=0):
@@ -159,7 +164,8 @@ class Monitor:
                 or not math.isfinite(value['created']) or value['created'] <= 0
                 or type(value.get('network_bytes')) not in (int, float)
                 or not math.isfinite(value['network_bytes']) or value['network_bytes'] < 0
-                or not isinstance(value.get('network_error', ''), str)):
+                or not isinstance(value.get('network_error', ''), str)
+                or not isinstance(value.get('network_via', ''), str)):
             raise ValueError('这轮任务的资源归属记录无效')
         if value.get('pid') != run.pid:
             return None
@@ -223,6 +229,8 @@ class Monitor:
             network_metric = _metric('ready', 'bytes_per_second', round(rate), threshold=NETWORK_HIGH)
         if owners.get('network_error'):
             network_metric = _metric('unavailable', 'bytes_per_second', reason=owners['network_error'])
+            if owners.get('network_via'):
+                network_metric['via'] = owners['network_via']
         if hasattr(self.gpu, 'sample_processes'):
             try:
                 identities = {root.pid: root.create_time(), **{pid: child.create_time() for pid, child in children.items()}}
@@ -275,13 +283,17 @@ class Monitor:
         if self.gpu is not None:
             self.gpu.close()
 
-    def for_run(self, run):
-        with self.store.database.read_connection() as connection:
-            family = connection.execute(
-                'WITH RECURSIVE family(id) AS (SELECT ? UNION ALL '
-                'SELECT t.id FROM task_run t JOIN family f ON t.parent_run_id=f.id) '
-                "SELECT id,status FROM task_run WHERE id IN (SELECT id FROM family) AND status IN ('pending','running')",
-                (run.id,)).fetchall()
+    def for_run(self, run, family=None):
+        """这一轮连同后代的资源占用。`family` 是 `TaskRunStore.active_families` 给这一轮的那份，
+        任务中心整页一次查齐时传进来；不传就当场查。"""
+        if family is None:
+            with self.store.database.read_connection() as connection:
+                family = connection.execute(
+                    'WITH RECURSIVE family(id) AS (SELECT ? UNION ALL '
+                    'SELECT t.id FROM task_run t JOIN family f ON t.parent_run_id=f.id) '
+                    "SELECT id,status FROM task_run WHERE id IN (SELECT id FROM family) AND status IN ('pending','running')",
+                    (run.id,)).fetchall()
+            family = [{'id': row[0], 'status': row[1]} for row in family]
         if not family:
             return None
         rows = self.snapshot()

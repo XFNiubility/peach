@@ -1,10 +1,12 @@
 """版本化存量补修：本地事务、证据回执和有界后台派发。"""
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import time
 import threading
+import sqlite3
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,7 +15,7 @@ from filelock import FileLock, Timeout
 from . import artifact_rules, composite_alias_repair, metadata_text_repair, r18_legacy_repair, upgrade_rules
 from .field_owners import SCAN_FILENAME, is_protected, owner_of, write_owned_fields
 from .followups import FollowupType, Attempts, attempts_root, register
-from .fsutil import atomic_write_text
+from .fsutil import atomic_path, atomic_write_text
 from .migrations import sqlite_backup
 from .task_runs import MAX_FOLLOWUPS
 
@@ -59,11 +61,199 @@ def _manual_name(connection, entity_id: int) -> bool:
                            (entity_id,)).fetchone())
 
 
+#: 旧版从文件名误认的番号只清一次；清掉的行与原值记进同一条回执，可以按它整批撤回。
+STALE_CODES_KEY = 'stale-filename-codes-1'
+
+
+#: 永久删除后悬空的资料候选（#486）在 `ledger_upgrade_repair` 里的回执键；规则版本见 `upgrade_rules`。
+DANGLING_KEY = f'dangling-candidates-{upgrade_rules.DANGLING_CANDIDATES}'
+
+
+def restore_dangling_candidates(database, candidate_root) -> dict:
+    """按 `DANGLING_KEY` 的回执把悬空候选补修整批还原。
+
+    改挂的行与决定改回旧编号，撤下的行与清掉的决定原样放回。之后又被处理任务改过的行照样
+    按键改回；键已被别的行或决定占着的那几条跳过并计数。回执记下 `restored_at`，补修不再重做。
+    """
+    from .review_csv import read_rows, write_rows
+    root = Path(candidate_root)
+    with database.write_transaction() as connection:
+        stored = connection.execute('SELECT result_json FROM ledger_upgrade_repair WHERE id=?',
+                                    (DANGLING_KEY,)).fetchone()
+        if stored is None:
+            raise ValueError('没有悬空候选补修的回执')
+        receipt = json.loads(stored[0])
+        if receipt.get('restored_at'):
+            return {'rows': 0, 'decisions': 0, 'skipped': 0}
+        files: dict[str, tuple[list[str], list[dict]]] = {}
+
+        def rows_of(name: str, fallback: dict) -> list[dict]:
+            if name not in files:
+                rows = read_rows(root / name, missing_ok=True)
+                files[name] = (list(rows[0] if rows else fallback), rows)
+            return files[name][1]
+
+        restored = skipped = 0
+        for entry in receipt.get('withdrawn', []):
+            rows = rows_of(entry['file'], entry['row'])
+            if any(row['item_key'] == entry['row']['item_key'] for row in rows):
+                skipped += 1
+                continue
+            rows.append(dict(entry['row']))
+            restored += 1
+        for entry in receipt.get('repinned', []):
+            rows = rows_of(entry['file'], {})
+            taken = entry['item_key'] != entry['new_item_key'] and any(
+                row['item_key'] == entry['item_key'] for row in rows)
+            index = next((index for index, row in enumerate(rows)
+                          if row['item_key'] == entry['new_item_key']), None)
+            if index is None or taken:
+                skipped += 1
+                continue
+            rows[index] = {**rows[index], 'item_key': entry['item_key'], 'asset_id': str(entry['asset_id'])}
+            restored += 1
+        decisions = 0
+        for decision in receipt.get('decisions', []):
+            if decision.get('moved_to'):
+                changed = connection.execute(
+                    "UPDATE OR IGNORE review_decision SET item_key=? "
+                    "WHERE category='metadata_fields' AND item_key=?",
+                    (decision['item_key'], decision['moved_to'])).rowcount
+            else:
+                changed = connection.execute(
+                    "INSERT OR IGNORE INTO review_decision(category,item_key,status,reviewer,note,updated_at) "
+                    "VALUES('metadata_fields',?,?,?,?,?)",
+                    (decision['item_key'], decision['status'], decision['reviewer'], decision['note'],
+                     decision['updated_at'])).rowcount
+            decisions += changed
+            skipped += not changed
+        receipt['restored_at'] = time.time()
+        connection.execute('UPDATE ledger_upgrade_repair SET result_json=? WHERE id=?',
+                           (json.dumps(receipt, ensure_ascii=False), DANGLING_KEY))
+        for name, (header, rows) in files.items():
+            write_rows(root / name, header, rows, atomic=True)
+    return {'rows': restored, 'decisions': decisions, 'skipped': skipped}
+
+
+def stale_filename_codes(connection) -> list[dict]:
+    """旧版从文件名误认、现行规则已经不认的番号。
+
+    实例是手机录像的时间戳（`VID_20220818_125735_816` 记成 `125735-816`）和被截断的「名字_日期」
+    （个人投稿者的 `KUZU_250103` 记成 `KUZU-25010`）。这类行有了番号就被当成 JAV，日期式番号还会拿到
+    「无码」徽章。只看无主或由文件名扫描写入的番号，且文件名与所在文件夹按现行规则都认不出番号；
+    再满足下面一条才清：番号本身已不合现行形状；或番号没有完整出现在文件名与文件夹里，这一行也没有
+    任何目录资料（标题、片商、发行日）。带资料的那类是刮削按另一份身份改过的（`1pon-092415-001-fhd2`
+    实为 `092415_159`），不碰。
+    """
+    import re
+    from pathlib import PureWindowsPath
+    from .catalog_rules import compile_code_patterns, is_jav_code, normalise_code_key, release_code_from_filename
+    from .profiles import read_settings
+    patterns = compile_code_patterns(read_settings(connection).get('codePatterns'))
+    rows = []
+    for row in connection.execute(
+            "SELECT id,name,path,code,field_owners,catalog_title,studio,release_date FROM asset "
+            "WHERE medium='video' AND code IS NOT NULL AND code<>''"):
+        owner = owner_of(row['field_owners'], 'code')
+        if owner not in ('', SCAN_FILENAME):
+            continue
+        texts = (str(row['name'] or ''), PureWindowsPath(str(row['path'] or '')).parent.name)
+        if any(release_code_from_filename(text, patterns=patterns) for text in texts):
+            continue
+        body = re.escape(normalise_code_key(row['code'])).replace(r'\-', '[-_ ]?')
+        whole = any(re.search(rf'(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])', text, re.I) for text in texts)
+        described = row['catalog_title'] or row['studio'] or row['release_date']
+        if not is_jav_code(row['code']) or (not whole and not described):
+            rows.append({'id': row['id'], 'code': row['code']})
+    return rows
+
+
+#: 撤过旧番号证据的影片按现番号重采时，补全任务键上的规则段。上一轮改回番号时已按
+#: `processing-v2` 派过同一部片，键相同就会被当成派过而跳掉。
+CODE_EVIDENCE_RULE = 'code-evidence-1'
+CANDIDATE_FILE = 'library-metadata-field-candidates.csv'
+
+
+def _split_by_code(row: dict, old: str, current: str) -> tuple[list[dict], dict | None]:
+    """一行候选按旧、现番号拆开：撤下的候选，与改按现番号核身份的那一行（摘空了是 None）。"""
+    from .metadata_auto_apply import _candidate_identifies_code
+    try:
+        choices = [choice for choice in json.loads(row.get('candidates_json') or '[]') if isinstance(choice, dict)]
+    except ValueError:
+        return [], row
+    stale = [choice for choice in choices
+             if _candidate_identifies_code(old, choice) and not _candidate_identifies_code(current, choice)]
+    remaining = [choice for choice in choices if choice not in stale]
+    if not remaining:
+        return stale, None
+    # 留下的候选按现番号核身份；`refresh_current_values` 也按这一栏找影片。
+    return stale, {**row, 'code': current, 'query': current, 'source_count': len(remaining),
+                   'candidates_json': json.dumps(remaining, ensure_ascii=False)}
+
+
+def _orphan_snapshots(sources: Path, withdrawn: list[dict], codes) -> list[str]:
+    """撤下的候选出自哪几份旧番号快照；库里还有影片是那部片的不算。"""
+    from .catalog_rules import same_release_code
+    snapshots = []
+    pairs = {(row['code'], str(choice.get('source') or '')) for row in withdrawn for choice in row['candidates']}
+    for old, source in sorted(pairs):
+        path = sources / f'{old}-{source}.json'
+        if (source and path.is_file() and not path.is_symlink()
+                and not any(same_release_code(old, code) for code in codes)):
+            snapshots.append(str(path))
+    return snapshots
+
+
+def stale_code_evidence(connection, candidates: Path, sources: Path) -> dict:
+    """番号改过之后，旧番号下取到的资料候选和来源快照（#296）。
+
+    `MCDV-24` 曾被补零成 `MCDV-024`，按它从 r18.dev 取回的是 2004 年的另一部片；番号改回之后，
+    候选表那一行的 `code` 还写着旧番号，复核页按它核身份，那组资料就一直摆着。
+
+    判据是候选级的：这一行记的番号与影片现番号不是同一部片（`same_release_code`），且这条
+    候选认得旧番号、不认现番号。同一部片只是写法变了（`HEYZO-707` 改成 `HEYZO-0707`）的整行
+    放过；两个番号都不认的候选身份不明，也放过。用户批准过的行候选与账本值都不动，那是人的
+    结论，只把这一行的番号改成现番号：复核页按它核身份，按现番号重采回来的资料与批准值不同时，
+    这一行会以差异重新摆出。旧番号的快照只在库里已没有任何影片还是那部片时失效：真有 2004 年
+    那部 `MCDV-024` 的，快照是对的。
+    """
+    from .catalog_rules import same_release_code
+    from .review_csv import read_rows
+    rows = read_rows(candidates, missing_ok=True)
+    codes = {row[0]: row[1] for row in connection.execute(
+        "SELECT id,code FROM asset WHERE medium='video' AND disposal IS NULL AND code IS NOT NULL AND code<>''")}
+    approved = {row[0] for row in connection.execute(
+        "SELECT item_key FROM review_decision WHERE category='metadata_fields' AND status='approved'")}
+    kept, withdrawn, held, changed = [], [], [], False
+    for row in rows:
+        old = str(row.get('code') or '').strip()
+        asset_id = int(row['asset_id']) if str(row.get('asset_id') or '').isdigit() else 0
+        current = codes.get(asset_id)
+        if not old or not current or same_release_code(old, current):
+            kept.append(row)
+            continue
+        changed = True
+        if row['item_key'] in approved:
+            held.append(row['item_key'])
+            kept.append({**row, 'code': current, 'query': current})
+            continue
+        stale, rest = _split_by_code(row, old, current)
+        if stale:
+            withdrawn.append({'item_key': row['item_key'], 'asset_id': asset_id, 'code': old, 'target': current,
+                              'candidates': stale})
+        if rest is not None:
+            kept.append(rest)
+    return {'rows': kept if changed else None, 'withdrawn': withdrawn,
+            'snapshots': _orphan_snapshots(sources, withdrawn, codes.values()),
+            'approved_kept': held, 'asset_ids': sorted({row['asset_id'] for row in withdrawn})}
+
+
 def _catalog_plan(connection, sources: Path, *, catalog: bool = True) -> dict:
     text = metadata_text_repair.collect(connection, sources / 'library-metadata')
     if not catalog:
         return {'codes':[], 'fields':[], 'names':[], 'aliases':[], 'text':text, 'catalog':False}
-    from .catalog_rules import compile_code_patterns, release_code_from_filename, same_release_code
+    from .catalog_rules import (compile_code_patterns, normalise_code_key, release_code_from_filename,
+                                same_release_code)
     from .profiles import read_settings
     patterns = compile_code_patterns(read_settings(connection).get('codePatterns'))
     codes = []
@@ -71,7 +261,9 @@ def _catalog_plan(connection, sources: Path, *, catalog: bool = True) -> dict:
         if owner_of(row['field_owners'], 'code') != SCAN_FILENAME:
             continue
         expected = release_code_from_filename(row['name'] or '', patterns=patterns)
-        if expected and row['code'] and not same_release_code(expected, row['code']):
+        # 同一部片、规范写法变了的也改：HEYZO 定宽四位后，旧的 `HEYZO-707` 规范化就是 `HEYZO-0707`（#354）。
+        rewritten = row['code'] != expected == normalise_code_key(row['code'])
+        if expected and row['code'] and (rewritten or not same_release_code(expected, row['code'])):
             codes.append({'id': row['id'], 'current': row['code'], 'target': expected})
     fields = r18_legacy_repair.collect(connection, sources / 'library-metadata')
     names = r18_legacy_repair.collect_entities(connection, sources / 'library-metadata',
@@ -114,14 +306,24 @@ def _catalog_apply(connection, plan: dict) -> dict:
 
 
 def _stale_previews(contract, row):
-    """本地配套海报和九宫格分别按所属规则校验。"""
+    """本地配套海报和九宫格分别按所属规则校验。
+
+    只看本机影片：影片补全只给本机影片重抽九宫格、重读配套海报。网盘影片的九宫格是
+    `scripts/sheets.py` 抽的，没有规则签名，算它过期就每次换版都把整个网盘库派一遍，派完照旧过期。
+    """
     from .media_processing_policy import metadata_only
     from .platform import translate_ledger_path
+    if row['location'] != 'local':
+        return False
     poster = Path(getattr(contract, 'poster_root', Path(contract.candidate_root) / 'posters')) / f'{row["id"]}_4.jpg'
     if poster.is_file() and not (artifact_rules.current(poster, source_required=True) or artifact_rules.current(
             poster, upgrade_rules.LOCAL_POSTERS, source_required=True)):
         return True
     snapshot = translate_ledger_path(row['snapshot_path']) if row['snapshot_path'] else None
+    # SAR 补测只标记派生图过期；不能由此再自动安排整部影片的采集和重抽。
+    if snapshot is not None and any(artifact_rules.current(snapshot, f'invalid:{rule}') for rule in (
+            upgrade_rules.DISPLAY_DIMENSIONS, upgrade_rules.DISPLAY_DIMENSIONS_SAR)):
+        return False
     return (snapshot is not None and contract.snapshot_root is not None
             and snapshot.is_relative_to(contract.snapshot_root) and not artifact_rules.current(snapshot)
             and not metadata_only(contract.follow_state_root))
@@ -164,15 +366,33 @@ class UpgradeRepairs:
         active = sum(state in ('pending', 'running') for state in states)
         failed = sum(state in ('failed', 'interrupted') for state in states)
         review = int(local.get('review_count', 0)) + len(receipt.get('deferred', []))
-        state = 'failed' if self.error else 'running' if active else 'failed' if failed else 'review' if review else (
+        paused = receipt.get('media_paused', {})
+        state = 'failed' if self.error or paused else 'running' if active else 'failed' if failed else 'review' if review else (
             'complete' if receipt.get('dispatch_complete') and local else 'pending')
         items = [{'id': REVISION, 'label': '更新已有资料', 'state': local.get('state', 'pending'),
                   'changed': local.get('changed', {}), 'review_count': review},
                  {'id': 'background', 'label': '后台更新进度', 'state': state,
                   'pending': active, 'failed': failed, 'queued': len(queued)}]
-        return {'state': state, 'items': items, 'available': self.available, 'message': self.error}
+        return {'state': state, 'items': items, 'available': self.available,
+                'message': self.error or paused.get('message', '')}
 
-    def prepare(self) -> None:
+    def prepare(self, *, retry_media=False) -> None:
+        self._prepare_local()
+        if not self.available or not self.contract.task_runs.enabled:
+            return
+        if not retry_media and _read(self.receipt).get('media_paused'):
+            return
+        from .jobs import DiskSpaceDenied
+        try:
+            with FileLock(str(self.receipt) + '.lock', timeout=0):
+                self._prepare_display_dimensions()
+        except DiskSpaceDenied as error:
+            # 退出准备阶段的锁，再复用整批暂停；容量不足不关闭其他账本后台服务。
+            self.pause_media(error)
+            if retry_media:
+                raise
+
+    def _prepare_local(self) -> None:
         """服务恢复任务前应用本地确定性修复。"""
         if not self.available or not self.contract.task_runs.enabled:
             return
@@ -188,6 +408,9 @@ class UpgradeRepairs:
                     (CATALOG_REVISION, CATALOG_REVISION + ':text-*')).fetchone()
             if applied is not None:
                 self._restore_receipt(json.loads(applied[0]))
+                self._withdraw_stale_code_evidence()
+                self._settle_dangling_candidates()
+                self._isolate_system_files()
                 return
             self._restore_receipt(None)
             sources = Path(contract.follow_sources_root)
@@ -204,10 +427,13 @@ class UpgradeRepairs:
                          and row['action'] not in ('replace', 'rename') for row in plan['fields'] + plan['names'])
             review += sum(row['verdict'] == 'review' for row in plan['aliases'])
             review += sum(row['action'] == 'review' for row in plan['text']['rows'])
-            review += previous.get('local', {}).get('review_count', 0)
+            # 上一份回执的文字复核本轮已重新收集，只继承它的其余复核数。
+            carried = previous.get('local', {})
+            review += max(0, carried.get('review_count', 0) - carried.get('changed', {}).get('text_review', 0))
             with contract.database.write_transaction() as connection:
                 violations = {tuple(row) for row in connection.execute('PRAGMA foreign_key_check')}
                 changed = _catalog_apply(connection, plan)
+                garbled = changed.pop(metadata_text_repair.RECEIPT_KEY)
                 if connection.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                     raise RuntimeError('更新已有资料时账本完整性校验失败')
                 if any(tuple(row) not in violations for row in connection.execute('PRAGMA foreign_key_check')):
@@ -216,17 +442,268 @@ class UpgradeRepairs:
                 receipt = {'revision': REVISION, 'local': {'state': 'succeeded', 'changed': changed,
                            'review_count': review, 'before': before, 'after': after, 'backup': str(backup)},
                            'text_media_ids': plan['text']['asset_ids'],
+                           metadata_text_repair.RECEIPT_KEY: garbled,
                            'media_ids': sorted(set(failed + [row['id'] for row in plan['codes']]
                                                    + previous.get('media_ids', [])
                                                    + plan['text']['asset_ids'])),
                            'queued': dict(previous.get('queued', {})),
                            'deferred': list(previous.get('deferred', [])),
+                           'code_media_ids': list(previous.get('code_media_ids', [])),
+                           'media_paused': previous.get('media_paused', {}),
                            'dispatch_complete': bool(previous.get('dispatch_complete')) and not plan['text']['asset_ids'],
                            'text_only': prior is not None,
                            'prior_revision': prior[1] if prior else None}
                 connection.execute('INSERT INTO ledger_upgrade_repair(id,applied_at,result_json) VALUES(?,?,?)',
                                    (REVISION, str(time.time()), json.dumps(receipt, ensure_ascii=False)))
             atomic_write_text(self.receipt, json.dumps(receipt, ensure_ascii=False))
+            self._withdraw_stale_code_evidence()
+            self._settle_dangling_candidates()
+            self._isolate_system_files()
+
+    def _prepare_display_dimensions(self) -> None:
+        from . import display_dimensions_repair
+        key = display_dimensions_repair.RECEIPT_KEY
+        receipt = _read(self.receipt)
+        if key in receipt:
+            return
+        with self.contract.database.read_connection() as connection:
+            previous = connection.execute(
+                "SELECT result_json FROM ledger_upgrade_repair WHERE json_extract(result_json,?)=? "
+                "ORDER BY CAST(applied_at AS REAL) DESC LIMIT 1",
+                (f'$.{key}.rule', upgrade_rules.DISPLAY_DIMENSIONS_SAR)).fetchone()
+            legacy = connection.execute(
+                "SELECT result_json FROM ledger_upgrade_repair WHERE "
+                "json_extract(result_json,'$.display_dimensions.rule')=? "
+                "ORDER BY CAST(applied_at AS REAL) DESC LIMIT 1", (upgrade_rules.DISPLAY_DIMENSIONS,)).fetchone()
+            dimensions = display_dimensions_repair.collect(connection) if previous is None else {}
+            generations = {str(row['id']): display_dimensions_repair.generation(row) for row in connection.execute(
+                f'SELECT {display_dimensions_repair.IDENTITY_COLUMNS} FROM asset WHERE id IN (SELECT value FROM json_each(?))',
+                (json.dumps(list(dimensions)),))}
+        if previous is not None:
+            receipt[key] = json.loads(previous[0])[key]
+        else:
+            old = json.loads(legacy[0]) if legacy else receipt
+            if 'display_dimensions' in old:
+                receipt.setdefault('display_dimensions', old['display_dimensions'])
+            backup = self.contract.db_path.with_name(f'ledger.pre-sar-{time.time_ns()}.db')
+            self._backup_display_dimensions(backup)
+            receipt[key] = {'rule': upgrade_rules.DISPLAY_DIMENSIONS_SAR, 'dimensions': dimensions,
+                            'generations': generations, 'completed': {}, 'backup': str(backup)}
+        display = receipt[key]
+        if any(asset_id not in display['completed'] and
+               f'{MEDIA_TASK}:{upgrade_rules.DISPLAY_DIMENSIONS_SAR}:{display["generations"][asset_id]}:{asset_id}'
+               not in receipt.get('queued', {})
+               for asset_id in display['dimensions']):
+            receipt['dispatch_complete'] = False
+        self._save_receipt(receipt)
+
+    def _backup_display_dimensions(self, backup):
+        from .jobs import DiskSpaceDenied
+        from .settings_file import load_config
+        from .storage_budget import CapacityGuard
+        config = self.config or getattr(self.contract, 'upgrade_config', None) or load_config()
+        guard = CapacityGuard(config)
+        with self.contract.database.read_connection() as connection:
+            page_size = connection.execute('PRAGMA page_size').fetchone()[0]
+            pages = connection.execute('PRAGMA page_count').fetchone()[0]
+        guard.check(force=True, required_bytes=page_size * pages, destination=backup.parent)
+        try:
+            with atomic_path(backup) as temporary:
+                sqlite_backup(self.contract.db_path, temporary, pages=256,
+                              progress=lambda _status, remaining, _total: guard.check(
+                                  force=True, required_bytes=page_size * remaining, destination=backup.parent))
+        except (OSError, sqlite3.Error) as error:
+            if (getattr(error, 'errno', None) == errno.ENOSPC or getattr(error, 'winerror', None) in (39, 112)
+                    or getattr(error, 'sqlite_errorcode', None) == sqlite3.SQLITE_FULL):
+                raise DiskSpaceDenied('显示尺寸补测备份空间不足，已暂停本批媒体') from error
+            raise
+
+    def _isolate_system_files(self) -> None:
+        """旧系统元数据按路径规则隔离；回执保留原状态，媒体与关联行不动。"""
+        from . import system_file_repair
+        with self.contract.database.read_connection() as connection:
+            stored = connection.execute('SELECT result_json FROM ledger_upgrade_repair WHERE id=?',
+                                        (REVISION,)).fetchone()
+            receipt = json.loads(stored[0]) if stored else None
+            if receipt is None or system_file_repair.RULE in receipt:
+                return
+            earlier = connection.execute(
+                'SELECT result_json FROM ledger_upgrade_repair WHERE json_type(result_json,?) IS NOT NULL '
+                'ORDER BY applied_at DESC LIMIT 1', (f'$."{system_file_repair.RULE}"',)).fetchone()
+            if earlier:
+                receipt[system_file_repair.RULE] = json.loads(earlier[0])[system_file_repair.RULE]
+            else:
+                rows = system_file_repair.collect(connection)
+        if earlier:
+            self._save_receipt(receipt)
+            return
+        backup = None
+        if rows:
+            backup = self.contract.db_path.with_name(f'ledger.pre-upgrade-{time.time_ns()}.db')
+            sqlite_backup(self.contract.db_path, backup)
+        with self.contract.database.write_transaction() as connection:
+            changed = system_file_repair.apply(connection, rows, time.time())
+            receipt[system_file_repair.RULE] = {'isolated': changed, 'backup': str(backup) if backup else None}
+            connection.execute('UPDATE ledger_upgrade_repair SET result_json=? WHERE id=?',
+                               (json.dumps(receipt, ensure_ascii=False), REVISION))
+        atomic_write_text(self.receipt, json.dumps(receipt, ensure_ascii=False))
+
+    def _withdraw_stale_code_evidence(self) -> None:
+        """撤掉旧番号下取到的候选与快照（`stale_code_evidence`），被撤的影片按现番号重采。
+
+        每份回执做一次，在 `prepare` 里、处理任务恢复之前做：那时没有采集任务拿着候选表。
+        撤下的候选原样记进回执的 `code_evidence`，快照只加失效标记、正文不动，都能按它整批还原。
+        """
+        from .library_processing import FIELDS
+        from .review_csv import write_rows
+        output = Path(self.contract.candidate_root) / CANDIDATE_FILE
+        sources = Path(self.contract.follow_sources_root) / 'library-metadata'
+        with self.contract.database.write_transaction() as connection:
+            stored = connection.execute('SELECT result_json FROM ledger_upgrade_repair WHERE id=?',
+                                        (REVISION,)).fetchone()
+            receipt = json.loads(stored[0]) if stored else None
+            if receipt is None or 'code_evidence' in receipt:
+                return
+            plan = stale_code_evidence(connection, output, sources)
+            if plan['rows'] is not None:
+                write_rows(output, FIELDS, plan['rows'], atomic=True)
+            for path in plan['snapshots']:
+                artifact_rules.remember(Path(path), f'invalid:{CODE_EVIDENCE_RULE}')
+            receipt['code_evidence'] = {'withdrawn': plan['withdrawn'], 'snapshots': plan['snapshots'],
+                                        'approved_kept': plan['approved_kept']}
+            if plan['asset_ids']:
+                receipt['code_media_ids'] = sorted(set(receipt.get('code_media_ids', [])) | set(plan['asset_ids']))
+                receipt['media_ids'] = sorted(set(receipt.get('media_ids', [])) | set(plan['asset_ids']))
+                receipt['dispatch_complete'] = False
+            connection.execute('UPDATE ledger_upgrade_repair SET result_json=? WHERE id=?',
+                               (json.dumps(receipt, ensure_ascii=False), REVISION))
+        atomic_write_text(self.receipt, json.dumps(receipt, ensure_ascii=False))
+        if plan['withdrawn']:
+            LOGGER.info('旧番号下的资料候选：撤下 %s 行，快照失效 %s 份',
+                        len(plan['withdrawn']), len(plan['snapshots']))
+
+    def _settle_dangling_candidates(self) -> None:
+        """永久删除后悬空的资料候选与复核决定（`stale_candidates.settle_dangling_rows`），只做一次。
+
+        在 `prepare` 里、处理任务恢复之前做，那时没有采集任务拿着候选表。改挂的行连同决定
+        换成新编号；撤下的行原样、清掉的决定整行记进回执，`restore_dangling_candidates` 按它还原。
+        出错只记日志：读不了候选表不该挡住服务启动，下次启动再试。
+        """
+        try:
+            self._settle_dangling_candidates_once()
+        except Exception:
+            LOGGER.exception('悬空资料候选补修失败')
+
+    def _settle_dangling_candidates_once(self) -> None:
+        from .review_csv import write_rows
+        from .stale_candidates import metadata_candidate_files, settle_dangling_rows
+        with self.contract.database.read_connection() as connection:
+            if connection.execute('SELECT 1 FROM ledger_upgrade_repair WHERE id=?', (DANGLING_KEY,)).fetchone():
+                return
+        files = metadata_candidate_files(self.contract.candidate_root)
+        with self.contract.database.write_transaction() as connection:
+            plan = settle_dangling_rows(connection, files)
+            moved = {row['item_key']: row['new_item_key'] for row in plan['repinned']}
+            existing = {row[0] for row in connection.execute('SELECT id FROM asset')}
+            decisions = []
+            for row in connection.execute(
+                    "SELECT item_key,status,reviewer,note,updated_at FROM review_decision "
+                    "WHERE category='metadata_fields' AND item_key GLOB 'asset:[0-9]*:*'").fetchall():
+                asset_id = row[0].split(':')[1]
+                if asset_id.isdigit() and int(asset_id) not in existing:
+                    decisions.append({'item_key': row[0], 'status': row[1], 'reviewer': row[2],
+                                      'note': row[3], 'updated_at': row[4], 'moved_to': moved.get(row[0])})
+            for decision in decisions:
+                if decision['moved_to']:
+                    connection.execute("UPDATE review_decision SET item_key=? "
+                                       "WHERE category='metadata_fields' AND item_key=?",
+                                       (decision['moved_to'], decision['item_key']))
+                else:
+                    connection.execute("DELETE FROM review_decision WHERE category='metadata_fields' "
+                                       "AND item_key=?", (decision['item_key'],))
+            result = {'rule': upgrade_rules.DANGLING_CANDIDATES, 'repinned': plan['repinned'],
+                      'withdrawn': plan['withdrawn'], 'decisions': decisions}
+            connection.execute('INSERT INTO ledger_upgrade_repair(id,applied_at,result_json) VALUES(?,?,?)',
+                               (DANGLING_KEY, str(time.time()), json.dumps(result, ensure_ascii=False)))
+            # 候选件在事务里写，写不成整个事务回滚、下次启动重做（`_withdraw_stale_code_evidence` 同一做法）。
+            for path, (header, rows) in plan['files'].items():
+                write_rows(path, header, rows, atomic=True)
+        LOGGER.info('悬空资料候选：改挂 %s 行，撤下 %s 行，决定改挂或清掉 %s 条',
+                    len(plan['repinned']), len(plan['withdrawn']), len(decisions))
+
+    def _clear_stale_codes(self) -> None:
+        """清掉旧版从文件名误认的番号（`stale_filename_codes`），只做一次。"""
+        with self.contract.database.write_transaction() as connection:
+            if connection.execute('SELECT 1 FROM ledger_upgrade_repair WHERE id=?', (STALE_CODES_KEY,)).fetchone():
+                return
+            rows = stale_filename_codes(connection)
+            if rows:
+                write_owned_fields(connection, [row['id'] for row in rows], {'code': None}, SCAN_FILENAME)
+            connection.execute('INSERT INTO ledger_upgrade_repair(id,applied_at,result_json) VALUES(?,?,?)',
+                               (STALE_CODES_KEY, str(time.time()), json.dumps({'cleared': rows})))
+        LOGGER.info('旧版误认的番号：清掉 %s 条', len(rows))
+
+    def _release_studio_misses(self) -> None:
+        """旧版断网时记下的「官网未取得」各放一次重试（`studio_followup.release_unbounded_misses`）。
+
+        只改候选缓存里的记号文件，不写账本行；做过的记进 `ledger_upgrade_repair`，只做一次。
+        """
+        from .studio_followup import release_unbounded_misses
+        key = 'studio-unbounded-misses-1'
+        try:
+            with self.contract.database.read_connection() as connection:
+                if connection.execute('SELECT 1 FROM ledger_upgrade_repair WHERE id=?', (key,)).fetchone():
+                    return
+            changed = release_unbounded_misses(attempts_root(self.contract.candidate_root))
+            with self.contract.database.write_transaction() as connection:
+                connection.execute('INSERT OR IGNORE INTO ledger_upgrade_repair(id,applied_at,result_json) '
+                                   'VALUES(?,?,?)', (key, str(time.time()), json.dumps({'released': changed})))
+            LOGGER.info('旧的「官网未取得」放行重试：%s 条', changed)
+        except Exception:
+            LOGGER.exception('放行旧的「官网未取得」重试失败')
+
+    def _settle_verification(self) -> None:
+        """核查差异的结算规则（ADR-0139）对存量候选跑一遍，规则版本变了才再跑。
+
+        只喂带核查标记的那些行：其余候选的判据没变，这一步不替它们重判。有要处理的行才
+        先备份；结果连同规则版本记进 `ledger_upgrade_repair`，账本恢复到之前的备份时会重跑。
+        几千行要跑一两分钟，所以不在 `prepare` 里挡着服务启动，由 `start` 交给后台调度跑；
+        自动落库按批提交，页面上的写入照常穿插进来。
+        """
+        try:
+            self._settle_verification_once()
+        except Exception as exc:
+            self.error = str(exc)
+            LOGGER.exception('核查差异存量结算失败')
+
+    def _settle_verification_once(self) -> None:
+        from .metadata_auto_apply import _parsed_candidates, auto_apply_metadata
+        from .review_csv import read_candidates
+        key = f'verification-settlement-{upgrade_rules.VERIFICATION_SETTLEMENT}'
+        contract = self.contract
+        with contract.database.read_connection() as connection:
+            if connection.execute('SELECT 1 FROM ledger_upgrade_repair WHERE id=?', (key,)).fetchone():
+                return
+        rows, _source, _skipped = read_candidates('metadata_fields', Path(contract.candidate_root))
+        rows = [row for row in rows
+                if any(candidate.get('requires_review') for candidate in _parsed_candidates(row))]
+        result = {'rows': len(rows)}
+        if rows:
+            backup = contract.db_path.with_name(f'ledger.pre-upgrade-{time.time_ns()}.db')
+            sqlite_backup(contract.db_path, backup)
+            summary = auto_apply_metadata(
+                contract.database, Path(contract.candidate_root), candidate_rows=rows,
+                snapshot_root=Path(contract.follow_sources_root) / 'library-metadata',
+                active=lambda: not self.stopping.is_set())
+            if self.stopping.is_set():
+                return
+            result.update({name: summary[name] for name in
+                           ('applied', 'kept', 'refreshed', 'auto_rejected', 'left_to_review')},
+                          backup=str(backup))
+        with contract.database.write_transaction() as connection:
+            connection.execute('INSERT OR IGNORE INTO ledger_upgrade_repair(id,applied_at,result_json) '
+                               'VALUES(?,?,?)', (key, str(time.time()), json.dumps(result, ensure_ascii=False)))
+        LOGGER.info('核查差异存量结算：%s', result)
 
     def _restore_receipt(self, authoritative):
         try:
@@ -238,28 +715,51 @@ class UpgradeRepairs:
             atomic_write_text(self.receipt, json.dumps(authoritative, ensure_ascii=False))
 
     def _save_receipt(self, receipt):
-        encoded = json.dumps(receipt, ensure_ascii=False)
         with self.contract.database.write_transaction(notify=False) as connection:
-            if connection.execute('SELECT 1 FROM ledger_upgrade_repair WHERE id=?', (REVISION,)).fetchone() is None:
+            stored = connection.execute('SELECT result_json FROM ledger_upgrade_repair WHERE id=?', (REVISION,)).fetchone()
+            if stored is None:
                 raise ValueError('更新后的处理记录需要重新准备，请重试')
+            # 媒体测量已提交而文件回执没写成时，调度不能用旧文件覆盖成功检查点。
+            from .display_dimensions_repair import IDENTITY_COLUMNS, RECEIPT_KEY, generation
+            saved = json.loads(stored[0]).get(RECEIPT_KEY)
+            if saved is not None:
+                display = receipt.setdefault(RECEIPT_KEY, saved)
+                generations = display.setdefault('generations', {})
+                saved_generations = saved.get('generations', {})
+                different = [asset_id for asset_id in generations.keys() | saved_generations.keys()
+                             if generations.get(asset_id) != saved_generations.get(asset_id)]
+                if different:
+                    for row in connection.execute(
+                            f'SELECT {IDENTITY_COLUMNS} FROM asset WHERE id IN (SELECT value FROM json_each(?))',
+                            (json.dumps(different),)):
+                        generations[str(row['id'])] = generation(row)
+                completed = display.setdefault('completed', {})
+                for asset_id in list(completed):
+                    if not completed[asset_id].get('generation') or completed[asset_id]['generation'] != generations.get(asset_id):
+                        completed.pop(asset_id)
+                completed.update({asset_id: result for asset_id, result in saved.get('completed', {}).items()
+                                  if result.get('generation') and result['generation'] == generations.get(asset_id)})
+            encoded = json.dumps(receipt, ensure_ascii=False)
             connection.execute('UPDATE ledger_upgrade_repair SET result_json=? WHERE id=? AND result_json<>?',
                                (encoded, REVISION, encoded))
         atomic_write_text(self.receipt, encoded)
 
-    def _plan(self, receipt: dict):
+    def _media_backlog(self) -> int:
+        """已经派出、还没轮到的影片补全条数。"""
+        with self.contract.database.read_connection() as connection:
+            return connection.execute("SELECT count(*) FROM task_run WHERE task_key=? AND status IN ('pending','running')",
+                                      (MEDIA_TASK,)).fetchone()[0]
+
+    def _plan(self, receipt: dict, *, media: bool = True, media_limit: int = MAX_FOLLOWUPS):
+        """`media` 为假时只排资料与人物后继，影片补全等前面那批跑下去再派。"""
         from . import (avatar_followup, creator_identity_followup, performer_alias_followup,
                        performer_profile_followup, seed_followup, studio_followup)
         from .library_processing import _people_allowed
-        from .media_sources import cost_for
         from .settings_file import load_config, DATA_ROOT_ENV
         config = load_config(environ={DATA_ROOT_ENV: str(self.config.data_root)}) if self.config is not None else load_config()
         seen = set(receipt.get('queued', {}))
-        inherited = set()
-        for key, run_id in receipt.get('queued', {}).items():
-            if key.startswith(MEDIA_TASK + ':'):
-                run = self.contract.task_runs.get(run_id)
-                if run is not None and run.status in ('pending', 'running', 'cancelled'):
-                    inherited.add(int(key.rsplit(':', 1)[1]))
+        inherited, inherited_display = self._inherited_media(receipt)
+
         attempts = Attempts(attempts_root(self.contract.candidate_root))
         with self.contract.database.read_connection() as connection:
             maximum = connection.execute('SELECT coalesce(max(id),0) FROM entity').fetchone()[0]
@@ -278,19 +778,64 @@ class UpgradeRepairs:
                     args.append(self.contract.avatar_root)
                 args.append(attempts)
                 planned.extend(planner.stock(*args, limit=min(16, remaining), skip=seen))
-            rows = connection.execute("SELECT id,code,name,path,location,snapshot_path FROM asset WHERE medium='video' "
+            if not media or receipt.get('media_paused'):
+                return planned[:MAX_FOLLOWUPS]
+            rows = connection.execute("SELECT id,code,name,path,location,size,mtime,snapshot_path FROM asset WHERE medium='video' "
                                       "AND disposal IS NULL ORDER BY id").fetchall()
+        return self._plan_media(receipt, config, rows, planned, seen, inherited, inherited_display, media_limit)
+
+    def _inherited_media(self, receipt):
+        """保留旧队列中仍在执行或取消的影片及文件世代，避免重复派发。"""
+        inherited, inherited_display = set(), set()
+        for key, run_id in receipt.get('queued', {}).items():
+            if key.startswith(MEDIA_TASK + ':'):
+                run = self.contract.task_runs.get(run_id)
+                if run is not None and run.status in ('pending', 'running', 'cancelled'):
+                    asset_id = int(key.rsplit(':', 1)[1])
+                    if f':{upgrade_rules.DISPLAY_DIMENSIONS_SAR}:' in key:
+                        inherited_display.add((asset_id, key.rsplit(':', 2)[1]))
+                    else:
+                        inherited.add(asset_id)
+        return inherited, inherited_display
+
+    def _plan_media(self, receipt, config, rows, planned, seen, inherited, inherited_display, media_limit):
+        """在余下配额中先补显示尺寸，再安排旧规则产物更新。"""
+        from .media_sources import cost_for
         from .followups import Followup
         selected = set(receipt.get('media_ids', []))
+        from .display_dimensions_repair import RECEIPT_KEY, generation, task_key
+        display = receipt.get(RECEIPT_KEY, {})
+        dimensions = display.get('dimensions', {})
+        completed = display.get('completed', {})
+        generations = display.setdefault('generations', {})
         deferred = []
+        media_count = 0
         for row in rows:
-            if row['id'] in inherited:
+            if media_count >= media_limit:
+                break
+            if row['id'] in inherited or (row['id'], generation(row)) in inherited_display:
+                continue
+            display_key = task_key(row)
+            if str(row['id']) in dimensions:
+                generations[str(row['id'])] = generation(row)
+                if completed.get(str(row['id']), {}).get('generation') != generation(row):
+                    completed.pop(str(row['id']), None)
+            if str(row['id']) in dimensions and str(row['id']) not in completed and display_key not in seen:
+                if cost_for(row['location'], row['path'], config) != 'free':
+                    deferred.append(row['id'])
+                    continue
+                planned.append(Followup(display_key, MEDIA_TASK, f'{_title(row)} · 补测显示尺寸'))
+                media_count += 1
+                if len(planned) >= MAX_FOLLOWUPS:
+                    break
                 continue
             if row['id'] not in selected and not _stale_previews(self.contract, row):
                 continue
             rule = upgrade_rules.PROCESSING
             if row['id'] in receipt.get('text_media_ids', []):
                 rule += f':text-{upgrade_rules.PROVIDER_TEXT}'
+            if row['id'] in receipt.get('code_media_ids', []):
+                rule += f':{CODE_EVIDENCE_RULE}'
             key = f'{MEDIA_TASK}:{rule}:{row["id"]}'
             if key in seen:
                 continue
@@ -298,6 +843,7 @@ class UpgradeRepairs:
                 deferred.append(row['id'])
                 continue
             planned.append(Followup(key, MEDIA_TASK, _title(row)))
+            media_count += 1
             if len(planned) >= MAX_FOLLOWUPS:
                 break
         receipt['deferred'] = deferred
@@ -314,10 +860,17 @@ class UpgradeRepairs:
                     with self.contract.database.read_connection() as connection:
                         maximum = connection.execute('SELECT coalesce(max(id),0) FROM entity').fetchone()[0]
                         seed = seed_followup.plan(connection, since_entity_id=maximum)
-                    if not receipt.get('deferred') and not any(row.key not in receipt.get('queued', {}) for row in seed):
+                    if (not receipt.get('deferred') and not self._display_due(receipt)
+                            and not any(row.key not in receipt.get('queued', {}) for row in seed)):
                         return
                     receipt['dispatch_complete'] = False
-                planned = self._plan(receipt)
+                # 影片补全只有一条通道、一次一部；不等前面那批跑下去就每分钟再派一批，
+                # 整个库会在一两个小时里全堆进队列，任务中心满屏都是「已处理 0 / 64」。
+                available = MAX_FOLLOWUPS - self._media_backlog()
+                media = not receipt.get('media_paused') and available > 0
+                planned = self._plan(receipt, media=media, media_limit=max(0, available))
+                if not planned and not media:
+                    return
                 if not planned:
                     receipt['dispatch_complete'] = True
                 else:
@@ -331,6 +884,16 @@ class UpgradeRepairs:
         except Exception as exc:
             self.error = str(exc)
             LOGGER.exception('升级补修派发失败')
+
+    def _display_due(self, receipt):
+        from .display_dimensions_repair import IDENTITY_COLUMNS, RECEIPT_KEY, generation, task_key
+        display = receipt.get(RECEIPT_KEY, {})
+        with self.contract.database.read_connection() as connection:
+            rows = connection.execute(f'SELECT {IDENTITY_COLUMNS} FROM asset WHERE medium=\'video\' '
+                'AND disposal IS NULL AND id IN (SELECT value FROM json_each(?))',
+                (json.dumps(list(display.get('dimensions', {}))),)).fetchall()
+        return any(display.get('completed', {}).get(str(row['id']), {}).get('generation') != generation(row)
+                   and task_key(row) not in receipt.get('queued', {}) for row in rows)
 
     def _dispatch(self, planned, receipt):
         store = self.contract.task_runs
@@ -355,15 +918,65 @@ class UpgradeRepairs:
         except Exception as exc:
             store.finish(run.id, 'failed', error=str(exc))
             raise
+        finally:
+            store.prune(TASK_KEY)
         return True
+
+    def cloud_display_videos(self) -> int:
+        """网盘里还没加进显示尺寸补测的旧视频数；用户点过「补测网盘视频」就是 0。"""
+        from . import display_dimensions_repair as repair
+        try:
+            display = _read(self.receipt).get(repair.RECEIPT_KEY)
+        except (OSError, ValueError, TypeError):
+            return 0
+        if display is None or display.get('cloud_included_at'):
+            return 0
+        with self.contract.database.read_connection() as connection:
+            return sum(asset_id not in display.get('dimensions', {})
+                       for asset_id in repair.collect(connection, cloud=True))
+
+    def include_cloud_display_dimensions(self) -> dict:
+        """用户在「自动修复」里点了「补测网盘视频」：把网盘来源的旧视频加进显示尺寸补测。
+
+        升级时自动补测只看本机与局域网的来源（`display_dimensions_repair.collect`）；
+        网盘这一批交给用户决定什么时候做，照样受容量保护和计费来源设置约束。"""
+        if not self.available:
+            raise ValueError('更新后自动处理只在本机写入端可用')
+        from . import display_dimensions_repair as repair
+        self.prepare()
+        with FileLock(str(self.receipt) + '.lock', timeout=0):
+            receipt = _read(self.receipt)
+            display = receipt.get(repair.RECEIPT_KEY)
+            if display is None:
+                raise ValueError('显示尺寸补测还没准备好，请稍后再试')
+            with self.contract.database.read_connection() as connection:
+                extra = {asset_id: size for asset_id, size in repair.collect(connection, cloud=True).items()
+                         if asset_id not in display['dimensions']}
+                generations = {str(row['id']): repair.generation(row) for row in connection.execute(
+                    f'SELECT {repair.IDENTITY_COLUMNS} FROM asset WHERE id IN (SELECT value FROM json_each(?))',
+                    (json.dumps(list(extra)),))}
+            display['dimensions'].update(extra)
+            display.setdefault('generations', {}).update(generations)
+            display['cloud_included_at'] = time.time()
+            receipt['dispatch_complete'] = False
+            self._save_receipt(receipt)
+        self.tick()
+        return self.snapshot()
 
     def retry(self) -> dict:
         """显式重试失败项；用户取消的任务保持取消。"""
         if not self.available:
             raise ValueError('更新后自动处理只在本机写入端可用')
-        self.prepare()
+        self.prepare(retry_media=True)
         with FileLock(str(self.receipt) + '.lock', timeout=0):
             receipt = _read(self.receipt)
+            paused = receipt.get('media_paused', {})
+            if paused:
+                from .storage_budget import CapacityGuard
+                from .settings_file import load_config
+                config = self.config or getattr(self.contract, 'upgrade_config', None) or load_config()
+                CapacityGuard(config).check(force=True)
+                receipt.pop('media_paused')
             kept = {}
             for key, run_id in receipt.get('queued', {}).items():
                 run = self.contract.task_runs.get(run_id)
@@ -372,13 +985,51 @@ class UpgradeRepairs:
             receipt.update(queued=kept, dispatch_complete=False)
             self._save_receipt(receipt)
             self.error = ''
+        from . import task_control
+        from .update_tasks import _mutex, state_for
+        with _mutex(state_for(self.contract.db_path)):
+            for run_id, command_id in paused.get('commands', {}).items():
+                run = self.contract.task_runs.get(int(run_id))
+                if run is None or run.status not in ('pending', 'running'):
+                    continue
+                current = task_control.intent(self.contract.db_path, run.id, (run.parent_run_id, run.root_run_id))
+                if current.get('action') == 'pause' and current.get('id') == command_id:
+                    task_control.request(self.contract.task_runs, run.id, 'resume')
         self.tick()
         return self.snapshot()
+
+    def pause_media(self, error) -> None:
+        """磁盘触线后持久暂停整批；腾出空间或重启都不解除，显式重试才解除。"""
+        from . import task_control
+        from .update_tasks import _mutex, state_for
+        store = self.contract.task_runs
+        with FileLock(str(self.receipt) + '.lock'):
+            receipt = _read(self.receipt)
+            if receipt.get('media_paused'):
+                return
+            with self.contract.database.read_connection() as connection:
+                rows = connection.execute(
+                    "SELECT id,parent_run_id,root_run_id FROM task_run WHERE task_key=? "
+                    "AND host=? AND status IN ('pending','running')", (MEDIA_TASK, store.host)).fetchall()
+            with _mutex(state_for(self.contract.db_path)):
+                ids = [row['id'] for row in rows if task_control.requested(
+                    self.contract.db_path, row['id'], (row['parent_run_id'], row['root_run_id'])) == 'resume']
+                receipt['media_paused'] = {'message': f'{error}；影片自动补全已暂停，请检查缓存后显式重试',
+                                           'run_ids': ids, 'commands': {}}
+                self._save_receipt(receipt)
+                for run_id in ids:
+                    task_control.request(store, run_id, 'pause')
+                    receipt['media_paused']['commands'][str(run_id)] = task_control.intent(
+                        self.contract.db_path, run_id)['id']
+                self._save_receipt(receipt)
 
     def start(self) -> None:
         if self.available and not self.scheduler.running:
             self.tick()
             self.scheduler.add_job(self.tick, 'interval', seconds=60, max_instances=1, coalesce=True)
+            self.scheduler.add_job(self._settle_verification, max_instances=1)
+            self.scheduler.add_job(self._release_studio_misses, max_instances=1)
+            self.scheduler.add_job(self._clear_stale_codes, max_instances=1)
             self.scheduler.start()
 
     def stop(self) -> None:
@@ -390,9 +1041,15 @@ class UpgradeRepairs:
 
 
 def _media_run(contract, key: str, handle) -> dict:
+    # 旧队列保留撤下状态，新规则拥有独立回执。
+    if f':{upgrade_rules.DISPLAY_DIMENSIONS}:' in key:
+        return {'outcome': 'skipped', 'reason': '已停用自动显示尺寸重探，保留已有测量和预览'}
+    if f':{upgrade_rules.DISPLAY_DIMENSIONS_SAR}:' in key:
+        return _display_run(contract, key, handle)
     from .settings_file import load_config
     from .library_processing import process_library
-    from .jobs import JobPaused
+    from .jobs import DiskSpaceDenied, JobPaused
+    from .storage_budget import CapacityGuard
     asset_id = int(key.rsplit(':', 1)[1])
     config = getattr(contract, 'upgrade_config', None) or load_config()
     state_file = Path(contract.follow_state_root) / 'upgrade-repairs' / f'{asset_id}.json'
@@ -409,20 +1066,74 @@ def _media_run(contract, key: str, handle) -> dict:
     def active():
         return service is None or not service.stopping.is_set()
     try:
+        if service is not None:
+            paused = _read(service.receipt).get('media_paused')
+            if paused:
+                raise DiskSpaceDenied(paused['message'])
+        guard = CapacityGuard(config)
+        guard.check(force=True)
         result = process_library(config, contract.db_path, contract.candidate_root, contract.cover_root,
-                             database=contract.database, asset_ids=[asset_id], stage='collect',
+                             database=contract.database, asset_ids=[asset_id],
+                             stage='collect',
                              recheck_existing=True, job_id=job_id,
                              state_file=state_file, resume_state=previous or None,
                              active=active,
                              report=lambda state: handle.progress(
                                  label=f"{title} · {state.get('stage') or '更新影片资料'}"))
+        guard.check(force=True)
+    except DiskSpaceDenied as error:
+        if service is not None:
+            service.pause_media(error)
+        raise
     except InterruptedError:
         if not active():
             raise JobPaused('服务重启后继续') from None
         raise
-    if result.get('status') not in ('complete', 'succeeded') or result.get('issue_count'):
+    # 走完全程只剩这部片自己的问题（坏文件探不出时长、抽不出帧）算完成；有来源冷却暂缓的
+    # 还要等来源放开再补，留成失败交给后继重试。
+    finished = result.get('status') in ('complete', 'succeeded') or (
+        result.get('outcome') == 'partial' and not result.get('paused_count'))
+    if not finished:
         raise RuntimeError(result.get('error') or '影片升级补全未完成，请在任务中心查看后重试')
     return {'outcome': '影片升级补全完成', 'name': title, 'asset_id': asset_id}
+
+
+def _display_run(contract, key: str, handle) -> dict:
+    from . import display_dimensions_repair
+    from .jobs import DiskSpaceDenied, JobPaused
+    from .settings_file import load_config, DATA_ROOT_ENV
+    from .storage_budget import CapacityGuard
+    from .task_control import checkpoint
+    asset_id = int(key.rsplit(':', 1)[1])
+    supplied = getattr(contract, 'upgrade_config', None)
+    config = load_config(environ={DATA_ROOT_ENV: str(supplied.data_root)}) if supplied else load_config()
+    service = getattr(contract, 'upgrade_repairs', None)
+    guard = CapacityGuard(config)
+
+    def available():
+        checkpoint('probe')
+        if service is not None and service.stopping.is_set():
+            raise JobPaused('服务重启后继续')
+        guard.check(force=True)
+
+    try:
+        if service is not None:
+            paused = _read(service.receipt).get('media_paused')
+            if paused:
+                raise DiskSpaceDenied(paused['message'])
+        handle.progress(label='补测视频显示尺寸')
+        result = display_dimensions_repair.reprobe(contract, config, asset_id, checkpoint=available,
+                                                   expected_generation=key.rsplit(':', 2)[1])
+    except DiskSpaceDenied as error:
+        if service is not None:
+            service.pause_media(error)
+        raise
+    except InterruptedError:
+        if service is not None and service.stopping.is_set():
+            raise JobPaused('服务重启后继续') from None
+        raise
+    return {'outcome': 'skipped' if result.get('skipped') else '显示尺寸补测完成',
+            'asset_id': asset_id, 'dimensions_changed': result['changed']}
 
 
 TYPE = register(FollowupType(MEDIA_TASK, '更新影片资料', True, _media_run))

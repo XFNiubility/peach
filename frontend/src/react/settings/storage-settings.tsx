@@ -22,9 +22,10 @@ import { cardClass } from '../components/card';
 import { LoadingDots } from '../components/loading-dots';
 import { PathLine } from '../components/path-line';
 import { Progress } from '../components/progress';
-import { ErrorText, Fact, FactList, Footer, Help, Stack, Section } from './section';
+import { CommandSteps, ErrorText, Fact, FactList, Footer, Help, Stack, Section } from './section';
 import { CATEGORY_SWATCH, REST_SWATCH, StorageOverview } from './storage-charts';
 import { busyProps, useAction } from './use-action';
+import { StorageBudgetSettings } from './storage-budget-settings';
 
 const STORAGE_URL = '/api/configuration/storage';
 const POLL_MS = 1500;
@@ -101,6 +102,11 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
   const reported = useRef(running);
 
   useEffect(() => {
+    if (initial.usage || initial.job.state !== 'idle' || document.body.classList.contains('peach-guiding')) return;
+    void action.run('measure', signal => apiSend<StorageState>(`${STORAGE_URL}/measure`, {}, 'POST', signal), setStorage);
+  }, []);
+
+  useEffect(() => {
     if (!running) return;
     const controller = new AbortController();
     const timer = setTimeout(() => {
@@ -174,7 +180,7 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
     if (next) copy.add(key); else copy.delete(key);
     return copy;
   });
-  return (
+  return (<>
     <Section id="storageSettings" guide="storage" title="存储空间">
       <FactList>
         <Fact term="数据目录">
@@ -184,6 +190,8 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
       </FactList>
       <Stack divided>
         {storage.job.state === 'measuring' ? <Measuring job={storage.job} /> : null}
+        {usage?.capacity_error ? <ErrorText>容量统计不完整：{usage.capacity_error}</ErrorText> : null}
+        {usage?.allocated_bytes != null ? <Help>Peach 数据实际占盘 {fmtSize(usage.allocated_bytes)}；分类图按文件大小统计。</Help> : null}
         {usage
           ? <div data-storage-result="" className={cardClass({ variant: 'outlined', padding: 'none', className: 'flex flex-col' })}>
               <div className="border-b border-separator-border p-4"><StorageOverview storage={storage} /></div>
@@ -199,16 +207,7 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
         {!storage.relocation.available ? <Help>{storage.relocation.message}</Help> : null}
         {/* 设置页迁移不了的部署（容器）：宿主机上该做的几步，每步一句说明加一条可照抄的命令。 */}
         {!storage.relocation.available && storage.relocation.steps?.length
-          ? <ol className="flex list-decimal flex-col gap-2 pl-5 text-body-2-regular text-text-secondary" aria-label="在宿主机上迁移">
-              {storage.relocation.steps.map((step) => (
-                <li key={step.command}>
-                  {step.text}
-                  <code className="mt-1 block rounded-md bg-background-tertiary-default px-2 py-1 text-caption-1-regular break-all text-text-primary">
-                    {step.command}
-                  </code>
-                </li>
-              ))}
-            </ol>
+          ? <CommandSteps label="在宿主机上迁移" steps={storage.relocation.steps} />
           : null}
         {storage.job.error ? <ErrorText>{storage.job.message}</ErrorText> : null}
         {action.error ? <ErrorText>{action.error}</ErrorText> : null}
@@ -232,5 +231,7 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
         </Button>
       </Footer>
     </Section>
+    {storage.budget ? <StorageBudgetSettings initial={storage.budget} after={setStorage} receipt={receipt} /> : null}
+    </>
   );
 }

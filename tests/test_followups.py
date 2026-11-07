@@ -141,6 +141,30 @@ class EnqueueTests(LedgerTestCase):
 
 
 class RunnerTests(LedgerTestCase):
+    def test_retention_keeps_failed_followups_available_for_retry(self):
+        parent = self.parent()
+        rows = self.store.enqueue_followups(parent.id, [(f'avatar:{i}', AVATAR_TASK_KEY, str(i))
+                                                       for i in range(23)])['queued']
+        self.store.finish(rows[0], 'failed', error='source unavailable')
+        self.store.finish(parent.id, 'succeeded')
+        with registered(echo_type(AVATAR_TASK_KEY)):
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 22)
+        self.assertEqual(self.store.get(rows[0]).status, 'failed')
+        with self.database.read_connection() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM task_run WHERE task_key=? "
+                                                "AND status='succeeded'", (AVATAR_TASK_KEY,)).fetchone()[0], 20)
+
+    def test_finished_followups_obey_retention_after_their_parent_settles(self):
+        parent = self.parent()
+        self.store.enqueue_followups(parent.id, [(f'avatar:{i}', AVATAR_TASK_KEY, str(i)) for i in range(21)])
+        self.store.finish(parent.id, 'succeeded')
+        with registered(echo_type(AVATAR_TASK_KEY)):
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 21)
+        with self.database.read_connection() as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM task_run WHERE task_key=?',
+                                                (AVATAR_TASK_KEY,)).fetchone()[0], 20)
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+
     def contract(self):
         return SimpleNamespace(task_runs=self.store)
 
@@ -170,7 +194,7 @@ class RunnerTests(LedgerTestCase):
 
         with registered(echo_type("code-samples", run=chunk), echo_type(AVATAR_TASK_KEY, run=avatar)):
             self.store.enqueue_followups(parent.id, [
-                ("code-samples:stock", "code-samples", "补番号样张"),
+                ("code-samples:stock", "code-samples", "番号样张采集"),
                 ("entity-avatar:performer:1", AVATAR_TASK_KEY, "甲")])
             self.assertEqual(FollowupRunner(self.contract()).drain(), 4)
         self.assertEqual(order, ["code-samples:stock", "entity-avatar:performer:1",
@@ -352,7 +376,7 @@ class BackgroundJobDispatchTests(LedgerTestCase):
 
     def declared(self):
         return [{"key": "entity-avatar:performer:1", "task_key": AVATAR_TASK_KEY,
-                 "label": "补全资料图片：甲"}]
+                 "label": "资料图片补全：甲"}]
 
     def test_a_successful_run_dispatches_what_it_declared(self):
         job = self.job()
@@ -1589,6 +1613,7 @@ class ProcessLibraryTests(LedgerTestCase):
         offline = {performer_alias_followup.MINNANO: Offline(),
                    performer_alias_followup.AV_NEME: Offline()}
         profile_offline = {performer_profile_followup.MINNANO: Offline(),
+                           performer_profile_followup.AVBASE: Offline(),
                            performer_profile_followup.AVWIKIDB: Offline(),
                            performer_profile_followup.JAVDB: Offline()}
         with mock.patch.object(performer_alias_followup, 'open_sites', return_value=offline), \

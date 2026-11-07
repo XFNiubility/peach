@@ -5,7 +5,8 @@ import { photoSize } from './../appearance/layout';
 import { $, ROUTE_ENTITIES } from '../core';
 import { fitSkeleton, LOAD_MORE_STATUS, loadingDotsHtml, revealSkeleton } from '../ui-kit';
 import { junkCountSkeletonHtml, junkRoute } from './../junk-queue';
-import { state } from './../shell/index';
+import { state, presentedItem } from './../shell/index';
+import { mediaRouteLabel } from '../history/page-title';
 import { catalogCardRatio, catalogHeadProps, catalogSkeletonHtml, clearCatalogGrid, gridTaken, paintCatalogFilter, syncCatalogFilterScreen } from './catalog.js';
 import { followListLayout, followManageParams, indexState, showIndexContainer } from './index.js';
 import { applicationEffects } from './effects';
@@ -15,6 +16,7 @@ import { indexParams, paintIndexSkeleton } from './../index-skeleton';
 import { showEntityLoading } from './entity.js';
 import { routeMetaOf } from './../history/route-meta';
 import { javTab } from '../react/jav/jav-navigation';
+import { paintWallBootSkeleton } from '../react/video-wall/wall-boot';
 export const loadingState = { setGridCards: undefined, gridCards: undefined, managementPlaceholder: undefined, wantsDiscoveryBars: undefined, entityShapesReady: undefined, ENTITY_SHAPES_WAIT: undefined, syncPageTitle: undefined };
 
 export function renderCatalogLoading(label='正在读取作品'){
@@ -72,7 +74,7 @@ export function renderInitialSurfaceLoading(){
      等它写的话骨架会先按默认版式铺一遍，数据到货再跳成分栏。 */
   document.body.dataset.surface=location.pathname;
   if(path==='/wall'){
-    document.body.setAttribute('data-wall-open','');hideDiscoveryBars();return;
+    document.body.setAttribute('data-wall-open','');hideDiscoveryBars();paintWallBootSkeleton();return;
   }
   if(/^\/assets\/\d+$/.test(path)){
     /* 详情的骨架归舞台岛：路由到位后 `openItem` 取回 React 包就画。下面那份列表由路由树的目录元素补发。 */
@@ -151,7 +153,7 @@ loadingState.ENTITY_SHAPES_WAIT = 400;
 loadingState.syncPageTitle = path=>{
   const url=new URL(path,location.origin);
   const pathname=decodeURIComponent(url.pathname);
-  const label=routeMetaOf(pathname)?.title;
+  const label=mediaRouteLabel(pathname,presentedItem)||routeMetaOf(pathname)?.title;
   document.title=label?`${label} · Peach`:'Peach · 蜜桃';
   document.body.dataset.surface=url.pathname;
   paintNav();

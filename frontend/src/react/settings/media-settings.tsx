@@ -37,11 +37,25 @@ import {
 import { PushDiscoveryForm } from './push-discovery-settings';
 import { rememberShape } from '../../configuration-skeleton';
 import { useLibraryTints } from '../components/library-tint';
+import { useOrderedLibraries } from '../components/library-order';
 import { LIBRARY_FOLDER_HELP } from './library-policy-copy';
 import {
   ErrorText, ExternalLink, Fact, FactList, Footer, Help, Section, SourceMark, Stack,
 } from './section';
 import { busyProps, useAction } from './use-action';
+import { confirmModal } from '@peach/legacy/ui';
+import { fetchLibraryProcessing, processingActive, restartEffectText } from '../library-processing/library-processing';
+
+/** 保存会重启 Peach。扫描与采集在跑时先确认；读不到任务状态就照常保存，不让旁路读数挡住保存。 */
+async function confirmRestartDuringProcessing(scanAfterSave: boolean): Promise<boolean> {
+  let state;
+  try { state = await fetchLibraryProcessing() } catch { return true }
+  if (!processingActive(state)) return true;
+  const { confirmed } = await confirmModal({
+    title: '扫描与采集正在进行', body: restartEffectText(state, scanAfterSave), confirmLabel: '仍然保存',
+  });
+  return confirmed;
+}
 
 const sourceName = (location: string) => MEDIA_SOURCES.find(([kind]) => kind === location)?.[1] ?? location;
 const sourceOptions = [...MEDIA_SOURCES, ['smb', 'SMB 共享'] as const];
@@ -130,6 +144,7 @@ function MediaForm({ data, receipt }: ConfigurationGroupProps) {
   const [smbResults, setSmbResults] = useState<Record<number, { message: string; directories: string[] }>>({});
   const [saved, setSaved] = useState<SaveResult | null>(null);
   const revision = useRef(data.revision);
+  const confirming = useRef(false);
   const action = useAction();
   // 订阅来源色样式表：改色时卡片当场试色，保存后服务端的颜色接替。
   useLibraryTints();
@@ -137,8 +152,8 @@ function MediaForm({ data, receipt }: ConfigurationGroupProps) {
     rows.forEach((row, i) => { if (row.library_id === rows[index]!.library_id) edit(i, patch); });
   };
   // 每个媒体库取它的第一行作代表：新加的空文件夹排在后面，不改动这一库的图标与来源。
-  const libraries = [...rows.reduce((found, row) => found.has(row.library_id) ? found : found.set(row.library_id, row),
-    new Map<string, MediaRow>()).values()];
+  const libraries = useOrderedLibraries([...rows.reduce((found, row) => found.has(row.library_id) ? found : found.set(row.library_id, row),
+    new Map<string, MediaRow>()).values()], row => row.library_id);
   // 「新建媒体库」把这个文件夹拆成新的一组，焦点交给新组的名称框，接着就能起名。
   const [named, setNamed] = useState<string | null>(null);
   useEffect(() => {
@@ -174,7 +189,16 @@ function MediaForm({ data, receipt }: ConfigurationGroupProps) {
       requestAnimationFrame(() => form.querySelector<HTMLButtonElement>(`[data-media-read-policy="${missing}"] button`)?.focus());
       return;
     }
+    if (action.busy || confirming.current) return;
     setFailure('');
+    confirming.current = true;
+    void confirmRestartDuringProcessing(scanNow).then((proceed) => {
+      confirming.current = false;
+      if (proceed) save();
+    });
+  };
+
+  const save = () => {
     void action.run('save', (signal) => apiSend<SaveResult>(CONFIGURATION_URL, {
       revision: revision.current,
       media_dirs: rows.map((row) => row.path),

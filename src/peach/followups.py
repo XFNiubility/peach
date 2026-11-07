@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .repository import in_background
 from .task_runs import TaskRunHandle, TaskRunStore
 
 LOGGER = logging.getLogger(__name__)
@@ -178,7 +179,7 @@ class FollowupRunner:
                 if thread is not None and thread.is_alive():
                     continue
                 thread = threading.Thread(
-                    target=self._work, args=(keys,), daemon=True,
+                    target=in_background(self._work), args=(keys,), daemon=True,
                     name=f"PeachFollowup-{lane}")
                 self._threads[lane] = thread
                 thread.start()
@@ -245,6 +246,12 @@ class FollowupRunner:
                 time.sleep(DEFER_POLL_SECONDS)
 
     def _execute(self, run):
+        try:
+            return self._execute_one(run)
+        finally:
+            self.store.prune(run.task_key, keep_errors=True)
+
+    def _execute_one(self, run):
         """跑一条后继；它给别的任务让路时返回那个 `JobDeferred`，否则返回 None。"""
         from .jobs import JobDeferred, JobPaused
         followup_type = REGISTRY.get(run.task_key)

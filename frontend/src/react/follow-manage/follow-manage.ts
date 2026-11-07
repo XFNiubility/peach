@@ -550,8 +550,11 @@ export interface FeedLookup {
   candidates: FeedCandidate[];
   /** 名字对得上、又只有一个人的那几张，先替用户勾上；同名不止一位时是空的。 */
   suggested: string[];
-  /** 数据库里按这个名字认得出的那位；认不出是 null，登记时会新建。 */
-  known: { id: number; name: string } | null;
+  /** 数据库里按这个名字认得出的那位；认不出是 null，登记时会新建。`subscribable` 是她已有
+   *  JavDB 演员页或 DMM 编号、不经搜索就能订，`following` 是已经在订。 */
+  known: { id: number; name: string; subscribable: boolean; following: boolean } | null;
+  /** JavDB 这一趟没搜成的原因；只在库里的她能直接订时随结果一起回来，否则整次查找报错。 */
+  unavailable?: string;
 }
 
 export const lookupFeedActor = (name: string, signal?: AbortSignal) =>
@@ -569,16 +572,19 @@ export interface FeedFollowed {
 export const followFeedByName = (name: string, ids: string[], signal?: AbortSignal) =>
   apiSend<FeedFollowed>(FEED_SOURCE_URL, { action: 'follow-name', name, ids }, 'POST', signal);
 
-/** 首屏：创作者来源、JAV 订阅与凭据状态取回来才画。
+/** 按库里认出的这位直接订，和人物页「订阅新作」开关同一个动作。 */
+export const followFeedEntity = (entityId: number, signal?: AbortSignal) =>
+  apiSend<{ entity_id: number; following: boolean; sources: number[] }>(
+    FEED_SOURCE_URL, { action: 'follow', entity_id: entityId, enabled: true }, 'POST', signal);
+
+/** 创作者来源、JAV 订阅与凭据分别读取，页面按各区域的状态显示。
  *
  * 两趟后台任务不在首屏里：它们的快照常年躺着上一趟的回执，等它们只会让首屏多等一个
  * 往返，而它们自己的键挂上去就会读。中止时 `fetchQuery` 把 `AbortError` 抛回挂载方。 */
 export async function prefetchFollowManage(signal: AbortSignal): Promise<void> {
-  await Promise.all([
-    queryClient.fetchQuery({ queryKey: FOLLOW_MANAGE_KEY, queryFn: () => fetchFollow(signal) }),
-    queryClient.fetchQuery({ queryKey: FOLLOW_CREDENTIALS_KEY, queryFn: () => fetchCredentials(signal) }),
-    queryClient.fetchQuery({ queryKey: FEEDS_KEY, queryFn: () => fetchFeeds(signal) }),
-  ]);
+  void queryClient.prefetchQuery({ queryKey: FOLLOW_CREDENTIALS_KEY, queryFn: () => fetchCredentials(signal) });
+  void queryClient.prefetchQuery({ queryKey: FEEDS_KEY, queryFn: () => fetchFeeds(signal) });
+  void queryClient.prefetchQuery({ queryKey: FOLLOW_MANAGE_KEY, queryFn: () => fetchFollow(signal) });
 }
 
 /** 把改动的那一条换进缓存。整页重取会把用户正在填的表单一起重画，也会让正在读这一屏的

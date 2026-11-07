@@ -21,8 +21,22 @@ import {
 } from '../settings-panel/settings-data';
 import { ErrorText, Help, Rows, Section, Stack, TaskCenterLink } from './section';
 import { busyProps } from './use-action';
+import { ProcessingMode } from '../library-processing/processing-effort';
 
 const THUMBNAIL_OPTIONS = [['off', '关闭'], ['precise', '每 10 秒一张'], ['coarse', '每 30 秒一张']] as const;
+
+export function TaskSpeedSettings({ receipt }: { receipt(message: string): void }) {
+  const settings = useQuery({ queryKey: SETTINGS_KEY, queryFn: ({ signal }) => fetchSettings(signal) });
+  const save = useSaveSettings();
+  const error = save.error || settings.error;
+  return <Section title="后台任务">
+    <Rows><SettingsRow label="默认处理速度" description="新任务使用此档位。运行中的任务可在活动页单独调整。">
+      <ProcessingMode value={settings.data?.taskSpeedMode || 'standard'} busy={!settings.data || save.isPending}
+        onChange={(mode) => save.mutate({ taskSpeedMode: mode }, { onSuccess: () => receipt('已保存默认处理速度') })} />
+    </SettingsRow></Rows>
+    {error ? <Stack divided><ErrorText>{errorMessage(error)}</ErrorText></Stack> : null}
+  </Section>;
+}
 
 export function VideoThumbnailRow({ epoch = 0 }: { epoch?: number }) {
   return <Section guide="timeline" title="时间轴缩略图"><VideoThumbnailControls epoch={epoch} /></Section>;
@@ -71,8 +85,8 @@ export function FollowPreferenceRows({ receipt }: { receipt(message: string): vo
       <Rows>
         <FollowScheduleRow />
         <FeedScheduleRow />
-        <SettingsRow label="首次采集范围">
-          <div id="followInitialDaysSetting">
+        <SettingsRow label="首次采集范围" description="新关注的来源第一次回看多久以前的内容。">
+          <div id="followInitialDaysSetting" className="shrink-0">
             <Select aria-label="首次采集范围" selectedKey={String(initialDays)}
               isDisabled={settings.isFetching || initial.isPending}
               onSelectionChange={(key) => {
@@ -87,8 +101,8 @@ export function FollowPreferenceRows({ receipt }: { receipt(message: string): vo
             </Select>
           </div>
         </SettingsRow>
-        <SettingsRow label="头像刷新">每 3 个月</SettingsRow>
-        <SettingsRow label="favicon 刷新">每年</SettingsRow>
+        <SettingsRow label="头像刷新" description="重新获取关注创作者的头像。"><span className="shrink-0">每 3 个月</span></SettingsRow>
+        <SettingsRow label="favicon 刷新" description="重新获取来源站点的图标。"><span className="shrink-0">每年</span></SettingsRow>
       </Rows>
       {error ? <Stack divided><ErrorText>{errorMessage(error)}</ErrorText></Stack> : null}
     </Section>
@@ -122,9 +136,10 @@ function FollowScheduleRow() {
   const error = save.error || status.error;
   return (
     <>
-      <SettingsRow label="自动检查更新">
-        {/* 间隔框只在开着时出现；这一行按有框的高度留位，读回状态时下面几行不跟着动。 */}
-        <div id="followScheduleSetting" className="flex min-h-9 min-w-0 flex-wrap items-center justify-end gap-2">
+      <SettingsRow label="自动检查更新" description="近 7 天有更新的来源按这个间隔检查，久未更新的逐级放慢，最长一天一次">
+        {/* 间隔框只在开着时出现；这一行按有框的高度留位，读回状态时下面几行不跟着动。
+            控件这一侧不收缩：窄屏上让左边的说明换行，不让开关与间隔框压到说明上。 */}
+        <div id="followScheduleSetting" className="flex min-h-9 shrink-0 flex-wrap items-center justify-end gap-2">
           <Switch aria-label="自动检查更新" isSelected={data?.enabled === true} isDisabled={blocked}
             onChange={(on) => {
               localStorage.setItem('peach.number.followScheduleSetting', String(remembered.current));
@@ -132,7 +147,7 @@ function FollowScheduleRow() {
             }} />
           {data?.enabled ? <div className="flex items-center gap-2">
             <Input type="number" inputMode="numeric" name="follow-interval" autoComplete="off"
-              aria-label="自动检查间隔" className="w-24"
+              aria-label="自动检查间隔" className="w-21 sm:w-24"
               value={draft} onChange={(value) => { setDraft(value); setInvalid(false) }} onBlur={commit}
               onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commit() } }}
               isDisabled={blocked} isInvalid={invalid} />

@@ -504,8 +504,8 @@ export function TastePage(props: TasteProps) {
         <div className="flex flex-wrap items-center justify-between gap-3">
           {/* 旧 `.insightswitch`：证据来源是两个互斥视图，形态是分段控件不是两枚裸按钮。 */}
           <TabList aria-label="口味分析的数据来源" className={SEGMENTED_TRACK}>
-            <Tab id="browser" className={SEGMENT}>浏览器记录</Tab>
             <Tab id="peach" className={SEGMENT}>Peach 观看与评价</Tab>
+            <Tab id="browser" className={SEGMENT}>浏览器记录</Tab>
           </TabList>
           <div className="flex flex-wrap items-center gap-2">
             <Select aria-label="分析范围" selectedKey={range}
@@ -631,7 +631,7 @@ function CoverageMetric({ term, value, rest }: { term: string; value: number; re
           <span className="ml-1.5 text-caption-1-regular text-text-secondary">{`${rest.toLocaleString()} 项待补`}</span>
         </b>
       </p>
-      <Progress label={`${term}：${value.toLocaleString()} / ${total.toLocaleString()}`}
+      <Progress meter label={`${term}：${value.toLocaleString()} / ${total.toLocaleString()}`}
         value={value} max={total} />
     </div>
   );

@@ -22,7 +22,7 @@ import {
 import { FollowManagePage } from '../../src/react/follow-manage/follow-manage-page';
 import { Credentials } from '../../src/react/follow-manage/credentials';
 
-import { actionOrder, buttonNamed, choose, click, linkNamed, mountRoot, settle, type } from './render';
+import { actionOrder, buttonNamed, choose, click, linkNamed, mountRoot, pending, settle, type } from './render';
 
 // 客户端是模块级的单例（所有 React 根共用一个），用例之间不清就互相喂数据。
 afterEach(() => queryClient.clear());
@@ -94,7 +94,7 @@ interface Plan {
   /** 登记一条来源。回 `refuse(...)` 就是这一条被服务端挡回来。 */
   add?: (body: { url: string; label: string }) => unknown;
   /** 订阅源清单。 */
-  feeds?: FeedsData;
+  feeds?: FeedsData | Promise<FeedsData>;
   /** 订阅源的开关、移除与按名字登记。回 `refuse(...)` 就是这一次被服务端挡回来。 */
   feedWrite?: (body: { action: string; id?: number; name?: string; ids?: string[] }) => unknown;
   /** 按女优名到 JavDB 搜演员卡的结果。回 `refuse(...)` 就是这一趟被服务端挡回来。 */
@@ -107,7 +107,7 @@ function serve(plan: Plan = {}) {
   const fetcher = vi.fn(async (input: string, init?: RequestInit) => {
     const url = String(input);
     const body = init?.body ? JSON.parse(String(init.body)) : null;
-    if (url === FEEDS_URL) return ok(plan.feeds ?? { sources: [], unread: 0 });
+    if (url === FEEDS_URL) return ok(await (plan.feeds ?? { sources: [], unread: 0 }));
     if (url === FEED_SOURCE_URL && plan.feedWrite) return plan.feedWrite(body);
     if (url === FEED_SOURCE_URL || url === FEEDS_CHECK_URL) return ok({ ok: true });
     if (url.startsWith(`${FEEDS_LOOKUP_URL}?`)) {
@@ -182,6 +182,18 @@ async function open(plan: Plan = {}, over: Partial<Props> = {}) {
 }
 
 const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms) });
+
+it('订阅响应未完成时先显示关注读数与列表，订阅读数独立等待', async () => {
+  const delayed = pending<FeedsData>();
+  const { host } = await open({ feeds: delayed.answer });
+  expect(host.querySelector('[data-measured-reading="creators"] [aria-busy="true"]')).toBeNull();
+  expect(host.querySelector('[data-measured-reading="subscriptions"] [aria-busy="true"]')).not.toBeNull();
+  expect(host.querySelector('[data-follow-toolbar-actions]')).not.toBeNull();
+  await delayed.release({ sources: [], unread: 9 });
+  await settle();
+  expect(host.querySelector('[data-measured-reading="releases"] [aria-busy="true"]')).toBeNull();
+  expect(host.querySelector('[data-measured-reading="releases"] [data-follow-reading]')?.textContent).toBe('9 条');
+});
 
 const cards = (root: ParentNode) => [...root.querySelectorAll('section[aria-label$="的关注来源"]')];
 
@@ -985,7 +997,7 @@ function nameField(root: ParentNode): HTMLInputElement {
 
 const actorPanel = (root: ParentNode) => root.querySelector('section[aria-label="添加 JAV 订阅"]')!;
 
-const card = (id: string, names: string[], record = '', held_by: FeedLookup['known'] = null) =>
+const card = (id: string, names: string[], record = '', held_by: { id: number; name: string } | null = null) =>
   ({ id, names, record, url: `https://javdb.com/actors/${id}`, held_by, matched: [] });
 
 const LOOKUP: FeedLookup = {
@@ -1096,6 +1108,23 @@ it('回车也是查找；勾的卡已在数据库里谁名下就说会挂给谁�
   expect(host.textContent).toContain('所勾的卡分属数据库里不同的人：甲、乙');
   expect(buttonNamed('添加订阅（2）', host)?.disabled).toBe(true);
   expect(sentBody(fetcher, FEED_SOURCE_URL)).toEqual([]);
+});
+
+it('JavDB 搜不成时，库里已有编号的她可以直接订，原因照样说明', async () => {
+  const lookup = vi.fn(() => ({ ...LOOKUP, suggested: [], candidates: [], unavailable: 'JavDB 没有搜成：来源正在冷却',
+    known: { id: 5, name: '瀬戸環奈', subscribable: true, following: false } }));
+  const feedWrite = vi.fn(() => ok({ ok: true, entity_id: 5, following: true, sources: [7] }));
+  const { host, props } = await open({ feeds: FEEDS, lookup, feedWrite }, { tab: 'add' });
+  await type(nameField(host), '瀬戸環奈');
+  await click(buttonNamed('查找', actorPanel(host)));
+  await settle();
+  expect(host.textContent).toContain('JavDB 没有搜成：来源正在冷却');
+  expect(host.textContent).toContain('数据库里的「瀬戸環奈」已有 JavDB 或 DMM 编号，可以直接订阅。');
+  expect(host.textContent).not.toContain('JavDB 上没有搜到这个名字。');
+  await click(buttonNamed('订阅「瀬戸環奈」', host));
+  await settle();
+  expect(feedWrite).toHaveBeenCalledWith({ action: 'follow', entity_id: 5, enabled: true });
+  expect(props.toast).toHaveBeenCalledWith('已订阅「瀬戸環奈」的新作');
 });
 
 it('查找被服务端挡回时原因摆在卡里，没有候选时直说', async () => {

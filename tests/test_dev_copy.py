@@ -11,11 +11,11 @@ from peach import dev_copy
 
 
 class DevCopyTests(unittest.TestCase):
-    def test_setup_copy_sources_can_be_saved_with_digest_protection(self):
+    def test_python_copy_sources_can_be_saved_with_digest_protection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             (root / 'src/peach').mkdir(parents=True)
-            for name in ('routes_pages.py', 'onboarding.py', 'media_sources.py'):
+            for name in ('routes_pages.py', 'onboarding.py', 'media_sources.py', 'release_updates.py'):
                 with self.subTest(name=name):
                     path = root / 'src/peach' / name
                     path.write_text("LABEL = '设置说明'", encoding='utf-8')
@@ -98,10 +98,20 @@ class DevCopyTests(unittest.TestCase):
                 tray = SimpleNamespace(_action_lock=threading.Lock(), manager=Mock(),
                                        _readiness=lambda: Step('readiness', 'current', '服务已就绪'))
                 gate = TaskGate(blocking=(ActiveRun(1, 'test', 'manual', 'running', os.getpid(), None),)) if blocked else TaskGate()
-                with patch('peach.runtime_prepare.task_gate', return_value=gate):
+                locked_at_terminal = []
+                def recording_write(target, data, write=runtime._write, lock=tray._action_lock, seen=locked_at_terminal):
+                    if data.get('state') in ('ready', 'error'):
+                        seen.append(lock.locked())
+                    return write(target, data)
+                with patch('peach.runtime_prepare.task_gate', return_value=gate), \
+                        patch.object(runtime, '_write', side_effect=recording_write):
                     runtime.poll(tray, root)
                     self._wait_for_state(runtime, root, 'error' if blocked else 'ready')
                 self.assertEqual(tray.manager.restart.call_count, 0 if blocked else 1)
+                if not blocked:
+                    tray.manager.restart.assert_called_once_with(reason='源码改字构建完成，重载服务')
+                # 终态写盘时托盘动作锁已经释放，看到终态的调用方不会抢在释放之前。
+                self.assertEqual(locked_at_terminal, [False])
                 self.assertFalse(tray._action_lock.locked())
 
     @staticmethod
